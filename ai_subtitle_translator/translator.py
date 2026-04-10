@@ -14,14 +14,16 @@ from ai_subtitle_translator.parser import Subtitle
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are a professional subtitle translator specializing in Persian (Farsi).
 
-Your task is to translate subtitles into natural, fluent, and simple Persian.
+def _build_system_prompt(language: str) -> str:
+    return f"""You are a professional subtitle translator specializing in {language}.
+
+Your task is to translate subtitles into natural, fluent, and simple {language}.
 
 STRICT RULES:
-- Keep the translation natural and conversational (like real spoken Persian)
+- Keep the translation natural and conversational (like real spoken {language})
 - Avoid literal translation
-- Use simple and clear Persian
+- Use simple and clear {language}
 - Preserve the exact number of subtitle items
 - Do NOT merge or split lines
 - Keep alignment with original meaning
@@ -29,10 +31,10 @@ STRICT RULES:
 - Output MUST be valid JSON
 
 STYLE:
-- Use modern spoken Persian
+- Use modern spoken {language}
 - Avoid formal/literary tone
 - Keep sentences short and natural
-- Make it sound like Persian movie subtitles
+- Make it sound like {language} movie subtitles
 
 INPUT:
 JSON array of subtitle objects with "id" and "text" fields.
@@ -49,6 +51,7 @@ class Translator:
             base_url=self._cfg.base_url,     # None → default OpenAI endpoint
         )
         self._semaphore = asyncio.Semaphore(self._cfg.max_concurrency)
+        self._system_prompt = _build_system_prompt(self._cfg.target_language)
         # Simple in-memory cache: source text -> translated text
         self._cache: dict[str, str] = {}
 
@@ -136,7 +139,7 @@ class Translator:
                     model=self._cfg.model,
                     temperature=self._cfg.temperature,
                     messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "system", "content": self._system_prompt},
                         {"role": "user", "content": user_content},
                     ],
                 )

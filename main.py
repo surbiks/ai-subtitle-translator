@@ -86,6 +86,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path for the translated SRT file (default: <input>.fa.srt)",
     )
     p.add_argument(
+        "-l", "--language",
+        default=None,
+        help="Target language (default: from .env or 'Persian (Farsi)')",
+    )
+    p.add_argument(
         "-m", "--model",
         default=None,
         help="OpenAI model (default: from .env or gpt-4o-mini)",
@@ -158,6 +163,8 @@ def main() -> None:
         chunk_cfg.overlap_lines = overlap
 
     translator_cfg = TranslatorConfig()
+    if args.language is not None:
+        translator_cfg.target_language = args.language
     if args.model is not None:
         translator_cfg.model = args.model
     if args.api_key is not None:

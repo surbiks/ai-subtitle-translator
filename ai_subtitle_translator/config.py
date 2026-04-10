@@ -32,6 +32,7 @@ class ChunkConfig:
 
 @dataclass
 class TranslatorConfig:
+    target_language: str = _env("TARGET_LANGUAGE", "Persian (Farsi)")  # type: ignore[assignment]
     model: str = _env("OPENAI_MODEL", "gpt-4o-mini")  # type: ignore[assignment]
     api_key: str | None = _env("OPENAI_API_KEY")
     base_url: str | None = _env("OPENAI_BASE_URL")
