@@ -1,4 +1,12 @@
-"""Async OpenAI translator with concurrency control, retries, and caching."""
+"""
+Async OpenAI translator with:
+- Context-aware prompting (previous chunk as read-only context)
+- Glossary injection
+- Subtitle compression guidance
+- Correction retry on invalid JSON
+- Optional refinement pass
+- Cache integration
+"""
 
 from __future__ import annotations
 
@@ -9,19 +17,29 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
+from ai_subtitle_translator.cache import TranslationCache
 from ai_subtitle_translator.config import TranslatorConfig
+from ai_subtitle_translator.glossary import Glossary
 from ai_subtitle_translator.parser import Subtitle
+from ai_subtitle_translator.postprocess import postprocess_persian
 
 logger = logging.getLogger(__name__)
 
+# -- Prompt builders --
 
-def _build_system_prompt(language: str) -> str:
+
+def _build_system_prompt(
+    language: str,
+    glossary: Glossary | None = None,
+) -> str:
+    glossary_section = glossary.build_prompt_section() if glossary and not glossary.is_empty else ""
+
     return f"""You are a professional subtitle translator specializing in {language}.
 
 Your task is to translate subtitles into natural, fluent, and simple {language}.
 
 STRICT RULES:
-- Keep the translation natural and conversational (like real spoken {language})
+- Keep translations natural and conversational (like real spoken {language})
 - Avoid literal translation
 - Use simple and clear {language}
 - Preserve the exact number of subtitle items
@@ -29,12 +47,13 @@ STRICT RULES:
 - Keep alignment with original meaning
 - Do NOT add explanations
 - Output MUST be valid JSON
+- Keep translations concise to fit subtitle reading speed
 
 STYLE:
 - Use modern spoken {language}
 - Avoid formal/literary tone
 - Keep sentences short and natural
-- Make it sound like {language} movie subtitles
+- Make it sound like {language} movie subtitles{glossary_section}
 
 INPUT:
 JSON array of subtitle objects with "id" and "text" fields.
@@ -43,26 +62,78 @@ OUTPUT:
 JSON array with the same "id" fields and translated "text" fields. Nothing else."""
 
 
+def _build_user_message(
+    payload: list[dict[str, Any]],
+    context: list[Subtitle] | None = None,
+) -> str:
+    """Build user message with optional previous-chunk context."""
+    parts: list[str] = []
+
+    if context:
+        ctx_lines = [f'  - [{s.id}] "{s.text}"' for s in context]
+        parts.append(
+            "Previous context (for continuity only, do NOT translate these):\n"
+            + "\n".join(ctx_lines)
+            + "\n"
+        )
+
+    parts.append("Translate the following:\n" + json.dumps(payload, ensure_ascii=False))
+    return "\n".join(parts)
+
+
+_REFINEMENT_PROMPT = """You are a Persian subtitle editor. Improve this translated subtitle text:
+- Make it more natural and conversational
+- Fix any awkward phrasing
+- Keep it concise for subtitle readability
+- Do NOT change the JSON structure
+
+Input and output: JSON array of {{"id": int, "text": string}}.
+Return ONLY the improved JSON array."""
+
+_CORRECTION_PROMPT = (
+    "Your previous output was not valid JSON. "
+    "Return ONLY a valid JSON array of objects with \"id\" (int) and \"text\" (string) fields. "
+    "No markdown, no explanation, just the JSON array."
+)
+
+
+# -- Translator --
+
+
 class Translator:
-    def __init__(self, config: TranslatorConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: TranslatorConfig | None = None,
+        glossary: Glossary | None = None,
+        cache: TranslationCache | None = None,
+    ) -> None:
         self._cfg = config or TranslatorConfig()
         self._client = AsyncOpenAI(
-            api_key=self._cfg.api_key,      # None → falls back to OPENAI_API_KEY env
-            base_url=self._cfg.base_url,     # None → default OpenAI endpoint
+            api_key=self._cfg.api_key,
+            base_url=self._cfg.base_url,
         )
         self._semaphore = asyncio.Semaphore(self._cfg.max_concurrency)
-        self._system_prompt = _build_system_prompt(self._cfg.target_language)
-        # Simple in-memory cache: source text -> translated text
-        self._cache: dict[str, str] = {}
+        self._glossary = glossary
+        self._cache = cache or TranslationCache()
+        self._system_prompt = _build_system_prompt(
+            self._cfg.target_language, glossary
+        )
+
+    @property
+    def cache(self) -> TranslationCache:
+        return self._cache
 
     async def translate_chunks(
         self,
         chunks: list[list[Subtitle]],
-        overlap: int = 0,
+        contexts: list[list[Subtitle] | None] | None = None,
     ) -> list[list[Subtitle]]:
         """Translate all chunks in parallel (bounded by semaphore)."""
+        if contexts is None:
+            contexts = [None] * len(chunks)
+
         tasks = [
-            self._translate_chunk(i, chunk, overlap)
+            self._translate_chunk(i, chunk, contexts[i])
             for i, chunk in enumerate(chunks)
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -71,11 +142,7 @@ class Translator:
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 logger.error("Chunk %d failed permanently: %s", i, result)
-                # Fallback: return original subtitles untranslated
-                chunk = chunks[i]
-                if overlap > 0 and i > 0:
-                    chunk = chunk[overlap:]
-                translated.append(chunk)
+                translated.append(chunks[i])  # fallback: original text
             else:
                 translated.append(result)
 
@@ -85,67 +152,90 @@ class Translator:
         self,
         index: int,
         chunk: list[Subtitle],
-        overlap: int,
+        context: list[Subtitle] | None,
     ) -> list[Subtitle]:
-        """Translate a single chunk with semaphore, retry, and cache."""
+        """Translate a single chunk with semaphore, cache, retry, and post-processing."""
         async with self._semaphore:
-            # Check if every line in the chunk is cached
-            all_cached = all(sub.text in self._cache for sub in chunk)
+            # Check cache for every line
+            all_cached = all(self._cache.has(s.text) for s in chunk)
             if all_cached:
                 logger.info("Chunk %d fully cached, skipping API call", index)
-                subs = _apply_cache(chunk, self._cache)
-                if overlap > 0 and index > 0:
-                    subs = subs[overlap:]
-                return subs
+                return self._build_from_cache(chunk)
 
-            payload = [{"id": s.id, "text": s.text} for s in chunk]
-            raw = await self._call_api_with_retry(index, payload)
-            translated_items = _parse_response(raw, expected_count=len(chunk))
+            # Build payload (join multi-line text with space for cleaner translation)
+            payload = [{"id": s.id, "text": s.text.replace("\n", " ")} for s in chunk]
 
-            # Build result subtitles and populate cache
+            user_msg = _build_user_message(payload, context)
+            raw = await self._call_with_retry_and_correction(index, user_msg, len(chunk))
+            translated_items = raw  # already parsed
+
+            # Refinement pass (optional)
+            if self._cfg.enable_refinement:
+                translated_items = await self._refine(index, translated_items)
+
+            # Build result with post-processing
             result: list[Subtitle] = []
             for orig, trans in zip(chunk, translated_items):
                 translated_text = trans.get("text", orig.text)
-                self._cache[orig.text] = translated_text
-                result.append(
-                    Subtitle(
-                        id=orig.id,
-                        start=orig.start,
-                        end=orig.end,
-                        text=translated_text,
-                    )
-                )
 
-            # Strip overlap items (they were only there for context)
-            if overlap > 0 and index > 0:
-                result = result[overlap:]
+                # Apply Persian post-processing if target is Persian
+                if "persian" in self._cfg.target_language.lower() or "farsi" in self._cfg.target_language.lower():
+                    translated_text = postprocess_persian(translated_text)
+
+                # Restore multi-line structure if original was multi-line
+                if "\n" in orig.text:
+                    translated_text = _restore_multiline(translated_text, orig.text)
+
+                self._cache.put(orig.text, translated_text)
+                result.append(Subtitle(
+                    id=orig.id, start=orig.start, end=orig.end, text=translated_text,
+                ))
 
             return result
 
-    async def _call_api_with_retry(
-        self, chunk_index: int, payload: list[dict[str, Any]]
-    ) -> str:
-        """Call the OpenAI API with exponential backoff retries."""
+    async def _call_with_retry_and_correction(
+        self,
+        chunk_index: int,
+        user_msg: str,
+        expected_count: int,
+    ) -> list[dict[str, Any]]:
+        """
+        Call the API with retries. On JSON parse failure, send a correction
+        prompt asking the model to fix its output.
+        """
         last_exc: Exception | None = None
-        user_content = json.dumps(payload, ensure_ascii=False)
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": user_msg},
+        ]
 
         for attempt in range(1, self._cfg.max_retries + 1):
             try:
                 logger.info(
-                    "Chunk %d: attempt %d/%d (%d items)",
-                    chunk_index, attempt, self._cfg.max_retries, len(payload),
+                    "Chunk %d: attempt %d/%d",
+                    chunk_index, attempt, self._cfg.max_retries,
                 )
                 response = await self._client.chat.completions.create(
                     model=self._cfg.model,
                     temperature=self._cfg.temperature,
-                    messages=[
-                        {"role": "system", "content": self._system_prompt},
-                        {"role": "user", "content": user_content},
-                    ],
+                    messages=messages,  # type: ignore[arg-type]
                 )
                 content = response.choices[0].message.content or ""
+
+                # Try to parse
+                items = _parse_response(content, expected_count)
                 logger.info("Chunk %d: success on attempt %d", chunk_index, attempt)
-                return content
+                return items
+
+            except (ValueError, json.JSONDecodeError) as parse_exc:
+                # JSON was invalid — ask model to correct
+                logger.warning(
+                    "Chunk %d attempt %d: invalid JSON — sending correction prompt",
+                    chunk_index, attempt,
+                )
+                messages.append({"role": "assistant", "content": content})
+                messages.append({"role": "user", "content": _CORRECTION_PROMPT})
+                last_exc = parse_exc
 
             except Exception as exc:
                 last_exc = exc
@@ -160,6 +250,41 @@ class Translator:
             f"Chunk {chunk_index} failed after {self._cfg.max_retries} attempts"
         ) from last_exc
 
+    async def _refine(
+        self, chunk_index: int, items: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Optional second pass: send translations back for fluency improvement."""
+        try:
+            logger.info("Chunk %d: refinement pass", chunk_index)
+            payload = json.dumps(items, ensure_ascii=False)
+            response = await self._client.chat.completions.create(
+                model=self._cfg.model,
+                temperature=self._cfg.temperature,
+                messages=[
+                    {"role": "system", "content": _REFINEMENT_PROMPT},
+                    {"role": "user", "content": payload},
+                ],
+            )
+            content = response.choices[0].message.content or ""
+            refined = _parse_response(content, len(items))
+            logger.info("Chunk %d: refinement successful", chunk_index)
+            return refined
+        except Exception as exc:
+            logger.warning("Chunk %d: refinement failed (%s), using original", chunk_index, exc)
+            return items
+
+    def _build_from_cache(self, chunk: list[Subtitle]) -> list[Subtitle]:
+        return [
+            Subtitle(
+                id=s.id, start=s.start, end=s.end,
+                text=self._cache.get(s.text) or s.text,
+            )
+            for s in chunk
+        ]
+
+
+# -- Helpers --
+
 
 def _parse_response(raw: str, expected_count: int) -> list[dict[str, Any]]:
     """
@@ -171,14 +296,13 @@ def _parse_response(raw: str, expected_count: int) -> list[dict[str, Any]]:
     # Strip markdown code fences if present
     if text.startswith("```"):
         lines = text.splitlines()
-        # Remove first and last fence lines
-        lines = [l for l in lines if not l.strip().startswith("```")]
+        lines = [ln for ln in lines if not ln.strip().startswith("```")]
         text = "\n".join(lines).strip()
 
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        # Last resort: try to find a JSON array in the text
+        # Try to find a JSON array in the text
         start = text.find("[")
         end = text.rfind("]")
         if start != -1 and end != -1:
@@ -195,12 +319,40 @@ def _parse_response(raw: str, expected_count: int) -> list[dict[str, Any]]:
             expected_count, len(data),
         )
 
+    # Validate each item has required fields
+    for item in data:
+        if "id" not in item or "text" not in item:
+            raise ValueError(f"Item missing 'id' or 'text': {item}")
+
     return data
 
 
-def _apply_cache(chunk: list[Subtitle], cache: dict[str, str]) -> list[Subtitle]:
-    """Build translated subtitles from cache."""
-    return [
-        Subtitle(id=s.id, start=s.start, end=s.end, text=cache[s.text])
-        for s in chunk
-    ]
+def _restore_multiline(translated: str, original: str) -> str:
+    """
+    If the original subtitle was multi-line, try to split the translated
+    text into the same number of lines (split roughly by midpoint).
+    """
+    original_lines = original.split("\n")
+    n_lines = len(original_lines)
+
+    if n_lines <= 1:
+        return translated
+
+    # Split translated text into roughly equal parts
+    words = translated.split()
+    if len(words) <= 1:
+        return translated
+
+    # Distribute words across lines as evenly as possible
+    per_line = max(1, len(words) // n_lines)
+    lines: list[str] = []
+    for i in range(n_lines):
+        start = i * per_line
+        if i == n_lines - 1:
+            lines.append(" ".join(words[start:]))
+        else:
+            lines.append(" ".join(words[start : start + per_line]))
+
+    # Filter out empty lines
+    lines = [ln for ln in lines if ln]
+    return "\n".join(lines) if lines else translated

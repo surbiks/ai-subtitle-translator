@@ -22,12 +22,19 @@ def _env_float(key: str, default: float) -> float:
     return float(val) if val else default
 
 
+def _env_bool(key: str, default: bool) -> bool:
+    val = os.getenv(key)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass
 class ChunkConfig:
     max_lines: int = _env_int("CHUNK_MAX_LINES", 18)
     max_chars: int = _env_int("CHUNK_MAX_CHARS", 1500)
     time_gap_threshold_ms: int = _env_int("CHUNK_TIME_GAP_MS", 2500)
-    overlap_lines: int = _env_int("CHUNK_OVERLAP_LINES", 2)
+    context_lines: int = _env_int("CHUNK_CONTEXT_LINES", 3)
 
 
 @dataclass
@@ -40,6 +47,10 @@ class TranslatorConfig:
     max_retries: int = _env_int("MAX_RETRIES", 3)
     retry_base_delay: float = _env_float("RETRY_BASE_DELAY", 1.0)
     temperature: float = _env_float("OPENAI_TEMPERATURE", 0.3)
+    enable_refinement: bool = _env_bool("ENABLE_REFINEMENT", False)
+    enable_postprocess: bool = _env_bool("ENABLE_POSTPROCESS", True)
+    glossary_path: str | None = _env("GLOSSARY_PATH")
+    cache_path: str | None = _env("CACHE_PATH")
 
 
 @dataclass
