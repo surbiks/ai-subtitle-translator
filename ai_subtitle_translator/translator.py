@@ -1,5 +1,7 @@
 """
-Async OpenAI translator with:
+Async subtitle translator with multi-provider support (OpenAI & Anthropic).
+
+Features:
 - Context-aware prompting (previous chunk as read-only context)
 - Glossary injection
 - Subtitle compression guidance
@@ -13,9 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
-
-from openai import AsyncOpenAI
+from typing import Any, Protocol
 
 from ai_subtitle_translator.cache import TranslationCache
 from ai_subtitle_translator.config import TranslatorConfig
@@ -97,6 +97,82 @@ _CORRECTION_PROMPT = (
 )
 
 
+# -- Provider abstraction --
+
+
+class _ChatProvider(Protocol):
+    """Minimal interface for an LLM chat call."""
+
+    async def chat(
+        self,
+        system: str,
+        messages: list[dict[str, str]],
+        model: str,
+        temperature: float,
+    ) -> str: ...
+
+
+class _OpenAIProvider:
+    """OpenAI-compatible provider (works with any OpenAI-compatible endpoint)."""
+
+    def __init__(self, api_key: str | None, base_url: str | None) -> None:
+        from openai import AsyncOpenAI
+
+        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+
+    async def chat(
+        self,
+        system: str,
+        messages: list[dict[str, str]],
+        model: str,
+        temperature: float,
+    ) -> str:
+        api_messages = [{"role": "system", "content": system}, *messages]
+        response = await self._client.chat.completions.create(
+            model=model,
+            temperature=temperature,
+            messages=api_messages,  # type: ignore[arg-type]
+        )
+        return response.choices[0].message.content or ""
+
+
+class _AnthropicProvider:
+    """Anthropic Claude provider."""
+
+    def __init__(self, api_key: str | None, base_url: str | None) -> None:
+        from anthropic import AsyncAnthropic
+
+        kwargs: dict[str, Any] = {}
+        if api_key:
+            kwargs["api_key"] = api_key
+        if base_url:
+            kwargs["base_url"] = base_url
+        self._client = AsyncAnthropic(**kwargs)
+
+    async def chat(
+        self,
+        system: str,
+        messages: list[dict[str, str]],
+        model: str,
+        temperature: float,
+    ) -> str:
+        response = await self._client.messages.create(
+            model=model,
+            max_tokens=4096,
+            temperature=temperature,
+            system=system,
+            messages=messages,  # type: ignore[arg-type]
+        )
+        return response.content[0].text
+
+
+def _build_provider(config: TranslatorConfig) -> _ChatProvider:
+    """Create the appropriate provider based on config."""
+    if config.provider == "anthropic":
+        return _AnthropicProvider(api_key=config.anthropic_api_key, base_url=config.anthropic_base_url)
+    return _OpenAIProvider(api_key=config.api_key, base_url=config.base_url)
+
+
 # -- Translator --
 
 
@@ -108,13 +184,19 @@ class Translator:
         cache: TranslationCache | None = None,
     ) -> None:
         self._cfg = config or TranslatorConfig()
-        self._client = AsyncOpenAI(
-            api_key=self._cfg.api_key,
-            base_url=self._cfg.base_url,
-        )
+        self._provider = _build_provider(self._cfg)
         self._semaphore = asyncio.Semaphore(self._cfg.max_concurrency)
         self._glossary = glossary
         self._cache = cache or TranslationCache()
+
+        # Resolve active model/temperature based on provider
+        if self._cfg.provider == "anthropic":
+            self._model = self._cfg.anthropic_model
+            self._temperature = self._cfg.anthropic_temperature
+        else:
+            self._model = self._cfg.model
+            self._temperature = self._cfg.temperature
+
         self._system_prompt = _build_system_prompt(
             self._cfg.target_language, glossary
         )
@@ -205,7 +287,6 @@ class Translator:
         """
         last_exc: Exception | None = None
         messages: list[dict[str, str]] = [
-            {"role": "system", "content": self._system_prompt},
             {"role": "user", "content": user_msg},
         ]
 
@@ -215,12 +296,12 @@ class Translator:
                     "Chunk %d: attempt %d/%d",
                     chunk_index, attempt, self._cfg.max_retries,
                 )
-                response = await self._client.chat.completions.create(
-                    model=self._cfg.model,
-                    temperature=self._cfg.temperature,
-                    messages=messages,  # type: ignore[arg-type]
+                content = await self._provider.chat(
+                    system=self._system_prompt,
+                    messages=messages,
+                    model=self._model,
+                    temperature=self._temperature,
                 )
-                content = response.choices[0].message.content or ""
 
                 # Try to parse
                 items = _parse_response(content, expected_count)
@@ -257,15 +338,12 @@ class Translator:
         try:
             logger.info("Chunk %d: refinement pass", chunk_index)
             payload = json.dumps(items, ensure_ascii=False)
-            response = await self._client.chat.completions.create(
-                model=self._cfg.model,
-                temperature=self._cfg.temperature,
-                messages=[
-                    {"role": "system", "content": _REFINEMENT_PROMPT},
-                    {"role": "user", "content": payload},
-                ],
+            content = await self._provider.chat(
+                system=_REFINEMENT_PROMPT,
+                messages=[{"role": "user", "content": payload}],
+                model=self._model,
+                temperature=self._temperature,
             )
-            content = response.choices[0].message.content or ""
             refined = _parse_response(content, len(items))
             logger.info("Chunk %d: refinement successful", chunk_index)
             return refined

@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c ':*)"
+      "Bash(python -c ':*)",
+      "Bash(python3 -c ':*)"
+    ],
+    "additionalDirectories": [
+      "/co/workspace/trans"
     ]
   }
 }

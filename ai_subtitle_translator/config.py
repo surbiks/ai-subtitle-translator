@@ -39,10 +39,15 @@ class ChunkConfig:
 
 @dataclass
 class TranslatorConfig:
+    provider: str = _env("PROVIDER", "openai")  # type: ignore[assignment]  # "openai" or "anthropic"
     target_language: str = _env("TARGET_LANGUAGE", "Persian (Farsi)")  # type: ignore[assignment]
     model: str = _env("OPENAI_MODEL", "gpt-4o-mini")  # type: ignore[assignment]
     api_key: str | None = _env("OPENAI_API_KEY")
     base_url: str | None = _env("OPENAI_BASE_URL")
+    anthropic_api_key: str | None = _env("ANTHROPIC_API_KEY")
+    anthropic_base_url: str | None = _env("ANTHROPIC_BASE_URL")
+    anthropic_model: str = _env("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")  # type: ignore[assignment]
+    anthropic_temperature: float = _env_float("ANTHROPIC_TEMPERATURE", 0.3)
     max_concurrency: int = _env_int("MAX_CONCURRENCY", 5)
     max_retries: int = _env_int("MAX_RETRIES", 3)
     retry_base_delay: float = _env_float("RETRY_BASE_DELAY", 1.0)

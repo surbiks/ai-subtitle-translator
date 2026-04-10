@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-AI Subtitle Translator — translates SRT subtitles using OpenAI.
+AI Subtitle Translator — translates SRT subtitles using OpenAI or Anthropic.
 
 Usage:
     python main.py input.srt output.srt
     python main.py input.srt                          # writes to input.fa.srt
     python main.py input.srt -m gpt-4o                # use a specific model
+    python main.py input.srt -p anthropic -m claude-sonnet-4-20250514  # use Anthropic
     python main.py input.srt --glossary glossary.json  # use a glossary
     python main.py input.srt --refine                  # enable refinement pass
 """
@@ -98,7 +99,7 @@ async def translate_file(
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Translate SRT subtitles using OpenAI",
+        description="Translate SRT subtitles using OpenAI or Anthropic",
     )
     p.add_argument("input", help="Path to the input SRT file")
     p.add_argument(
@@ -108,12 +109,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Translation
     p.add_argument(
+        "-p", "--provider", default=None, choices=["openai", "anthropic"],
+        help="API provider: 'openai' or 'anthropic' (default: from .env or 'openai')",
+    )
+    p.add_argument(
         "-l", "--language", default=None,
         help="Target language (default: from .env or 'Persian (Farsi)')",
     )
     p.add_argument(
         "-m", "--model", default=None,
-        help="OpenAI model (default: from .env or gpt-4o-mini)",
+        help="Model name (default: from .env or gpt-4o-mini)",
     )
     p.add_argument(
         "--api-key", default=None,
@@ -122,6 +127,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--base-url", default=None,
         help="OpenAI-compatible API base URL (default: from .env)",
+    )
+    p.add_argument(
+        "--anthropic-api-key", default=None,
+        help="Anthropic API key (default: from .env)",
+    )
+    p.add_argument(
+        "--anthropic-base-url", default=None,
+        help="Anthropic API base URL (default: from .env)",
+    )
+    p.add_argument(
+        "--anthropic-model", default=None,
+        help="Anthropic model (default: from .env or claude-sonnet-4-20250514)",
+    )
+    p.add_argument(
+        "--anthropic-temperature", type=float, default=None,
+        help="Anthropic sampling temperature (default: from .env or 0.3)",
     )
 
     # Quality
@@ -188,6 +209,8 @@ def main() -> None:
         chunk_cfg.context_lines = args.context_lines
 
     translator_cfg = TranslatorConfig()
+    if args.provider is not None:
+        translator_cfg.provider = args.provider
     if args.language is not None:
         translator_cfg.target_language = args.language
     if args.model is not None:
@@ -196,6 +219,14 @@ def main() -> None:
         translator_cfg.api_key = args.api_key
     if args.base_url is not None:
         translator_cfg.base_url = args.base_url
+    if args.anthropic_api_key is not None:
+        translator_cfg.anthropic_api_key = args.anthropic_api_key
+    if args.anthropic_base_url is not None:
+        translator_cfg.anthropic_base_url = args.anthropic_base_url
+    if args.anthropic_model is not None:
+        translator_cfg.anthropic_model = args.anthropic_model
+    if args.anthropic_temperature is not None:
+        translator_cfg.anthropic_temperature = args.anthropic_temperature
     if args.concurrency is not None:
         translator_cfg.max_concurrency = args.concurrency
     if args.glossary is not None:
