@@ -1,6 +1,6 @@
 # AI Subtitle Translator
 
-A production-grade async subtitle translation system that translates SRT files using the OpenAI or Anthropic API, with a focus on Persian (Farsi) translation quality.
+A production-grade async subtitle translation system that translates SRT and ASS subtitle files using the OpenAI or Anthropic API, with a focus on Persian (Farsi) translation quality.
 
 ## Features
 
@@ -29,13 +29,13 @@ A production-grade async subtitle translation system that translates SRT files u
 └── ai_subtitle_translator/
     ├── __init__.py
     ├── config.py                       # Dataclass configs, loads from .env
-    ├── parser.py                       # SRT file parsing
+    ├── parser.py                       # SRT/ASS parsing and subtitle document model
     ├── chunker.py                      # Adaptive hybrid chunking + context windows
     ├── translator.py                   # Async translation with provider abstraction, retry
     ├── glossary.py                     # Glossary loading and prompt injection
     ├── postprocess.py                  # Persian text normalization pipeline
     ├── cache.py                        # Translation cache with persistence
-    └── merger.py                       # Merge & write SRT output
+    └── merger.py                       # Merge & write SRT/ASS output
 ```
 
 ## Requirements
@@ -85,8 +85,11 @@ cp .env.sample .env
 ## Usage
 
 ```bash
-# Basic -- output writes to input.fa.srt
+# Basic SRT -- output writes to input.fa.srt
 python main.py movie.srt
+
+# Basic ASS -- output writes to input.fa.ass
+python main.py episode.ass
 
 # Specify output path
 python main.py movie.srt movie_fa.srt
@@ -140,8 +143,8 @@ python main.py movie.srt output.srt \
 
 | Flag | Description |
 |---|---|
-| `input` | Path to the input SRT file |
-| `output` | (Optional) Output path, defaults to `<input>.fa.srt` |
+| `input` | Path to the input subtitle file (`.srt` or `.ass`) |
+| `output` | (Optional) Output path, defaults to `<input>.fa.<ext>` |
 | `-p`, `--provider` | API provider (`openai` or `anthropic`) |
 | `-l`, `--language` | Target language |
 | `-m`, `--model` | Model name |
@@ -164,7 +167,7 @@ CLI flags override `.env` values when provided.
 
 ## How It Works
 
-1. **Parse** -- reads the SRT file into structured subtitle objects (id, timestamps, text)
+1. **Parse** -- reads the SRT or ASS file into structured subtitle objects (id, timestamps, text)
 2. **Chunk** -- groups subtitles using an adaptive hybrid strategy:
    - Splits on dialogue boundaries (time gaps > 2.5s)
    - Adapts size limits based on text density (short lines get bigger chunks, dense lines get smaller)
@@ -181,8 +184,53 @@ CLI flags override `.env` values when provided.
    - Latin-to-Persian punctuation conversion
    - Formal-to-conversational phrase simplification
 6. **Multi-line** -- joins multi-line text before translation, restores line structure after
+   - SRT line breaks are preserved as real newlines
+   - ASS line breaks are decoded from `\N` / `\n` and restored on write
 7. **Cache** -- caches source→translated pairs; optionally persists between runs
-8. **Merge** -- deduplicates, reassembles, and writes a valid SRT file with original timestamps preserved
+8. **Merge** -- deduplicates, reassembles, and writes a valid SRT or ASS file with original timing preserved
+
+## Architecture Notes
+
+### End-to-end flow
+
+`main.py` coordinates a linear pipeline:
+
+1. `parse_subtitle_file()` converts the input file into `Subtitle` dataclass objects
+2. `chunk_subtitles()` groups subtitles into translation-sized chunks
+3. `build_context_window()` attaches previous-chunk context for continuity
+4. `Translator.translate_chunks()` calls the configured LLM provider concurrently
+5. `merge_chunks()` flattens translated chunks back into subtitle order
+6. `write_subtitle_file()` writes the final subtitle file in the original format
+
+### Module responsibilities
+
+- `main.py`: CLI parsing, config overrides, pipeline orchestration, logging
+- `config.py`: `.env` loading and runtime dataclasses for chunking + translation settings
+- `parser.py`: format-aware parsing, `Subtitle` / `SubtitleDocument` models, ASS dialogue extraction
+- `chunker.py`: time-gap splitting, adaptive size limits, previous-chunk context windows
+- `translator.py`: prompt construction, provider abstraction, retries, correction prompts, refinement pass, multiline restoration, cache usage
+- `postprocess.py`: Persian-specific normalization after translation
+- `cache.py`: in-memory translation cache with optional JSON persistence
+- `glossary.py`: glossary loading and prompt injection
+- `merger.py`: dedupe, ordering, and SRT/ASS formatting/writing
+
+### Best places to change behavior
+
+- Change prompt wording or output rules: `ai_subtitle_translator/translator.py`
+- Add a new provider or alter provider-specific request shape: `ai_subtitle_translator/translator.py`
+- Tune chunk sizes or boundary logic: `ai_subtitle_translator/chunker.py`
+- Adjust Persian cleanup rules: `ai_subtitle_translator/postprocess.py`
+- Add new config/env settings: `ai_subtitle_translator/config.py` and `main.py`
+- Change SRT/ASS parsing or output formatting: `parser.py` and `merger.py`
+
+### Current implementation constraints
+
+- Multi-line subtitles are flattened before translation and rebuilt heuristically afterward
+- Cache keys are raw source subtitle text, so identical source lines reuse the same translation
+- Post-processing currently runs whenever target language contains `persian` or `farsi`
+- If a chunk fails permanently, the original source text is kept for that chunk instead of aborting the whole run
+- JSON response validation checks item shape and warns on item-count mismatch, but still uses the model output when possible
+- For ASS files, only dialogue text is translated; sections, styles, and non-dialogue event lines are preserved
 
 ## Glossary
 

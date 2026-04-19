@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-AI Subtitle Translator — translates SRT subtitles using OpenAI or Anthropic.
+AI Subtitle Translator — translates SRT or ASS subtitles using OpenAI or Anthropic.
 
 Usage:
     python main.py input.srt output.srt
     python main.py input.srt                          # writes to input.fa.srt
+    python main.py input.ass                          # writes to input.fa.ass
     python main.py input.srt -m gpt-4o                # use a specific model
     python main.py input.srt -p anthropic -m claude-sonnet-4-20250514  # use Anthropic
     python main.py input.srt --glossary glossary.json  # use a glossary
@@ -24,8 +25,8 @@ from ai_subtitle_translator.cache import TranslationCache
 from ai_subtitle_translator.chunker import build_context_window, chunk_subtitles
 from ai_subtitle_translator.config import AppConfig, ChunkConfig, TranslatorConfig
 from ai_subtitle_translator.glossary import Glossary
-from ai_subtitle_translator.merger import merge_chunks, write_srt
-from ai_subtitle_translator.parser import parse_srt
+from ai_subtitle_translator.merger import merge_chunks, write_subtitle_file
+from ai_subtitle_translator.parser import parse_subtitle_file
 from ai_subtitle_translator.translator import Translator
 
 logging.basicConfig(
@@ -46,8 +47,9 @@ async def translate_file(
 
     # 1. Parse
     logger.info("Parsing %s", input_path)
-    subtitles = parse_srt(input_path)
-    logger.info("Parsed %d subtitles", len(subtitles))
+    document = parse_subtitle_file(input_path)
+    subtitles = document.subtitles
+    logger.info("Parsed %d subtitles from %s", len(subtitles), document.format.upper())
 
     if not subtitles:
         logger.warning("No subtitles found — nothing to translate")
@@ -80,7 +82,7 @@ async def translate_file(
 
     # 7. Merge & write
     merged = merge_chunks(translated_chunks)
-    write_srt(merged, output_path)
+    write_subtitle_file(document, merged, output_path)
 
     # 8. Save cache
     if config.translator.cache_path:
@@ -99,12 +101,12 @@ async def translate_file(
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Translate SRT subtitles using OpenAI or Anthropic",
+        description="Translate SRT or ASS subtitles using OpenAI or Anthropic",
     )
-    p.add_argument("input", help="Path to the input SRT file")
+    p.add_argument("input", help="Path to the input subtitle file (.srt or .ass)")
     p.add_argument(
         "output", nargs="?", default=None,
-        help="Path for the translated SRT file (default: <input>.fa.srt)",
+        help="Path for the translated subtitle file (default: <input>.fa.<ext>)",
     )
 
     # Translation
@@ -197,7 +199,7 @@ def main() -> None:
     if args.output:
         output_path = args.output
     else:
-        output_path = str(input_path.with_suffix(".fa.srt"))
+        output_path = str(input_path.with_name(f"{input_path.stem}.fa{input_path.suffix}"))
 
     # Start from .env defaults, then override with any explicit CLI args
     chunk_cfg = ChunkConfig()

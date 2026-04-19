@@ -270,7 +270,11 @@ class Translator:
 
                 self._cache.put(orig.text, translated_text)
                 result.append(Subtitle(
-                    id=orig.id, start=orig.start, end=orig.end, text=translated_text,
+                    id=orig.id,
+                    start=orig.start,
+                    end=orig.end,
+                    text=translated_text,
+                    metadata=orig.metadata,
                 ))
 
             return result
@@ -354,8 +358,11 @@ class Translator:
     def _build_from_cache(self, chunk: list[Subtitle]) -> list[Subtitle]:
         return [
             Subtitle(
-                id=s.id, start=s.start, end=s.end,
+                id=s.id,
+                start=s.start,
+                end=s.end,
                 text=self._cache.get(s.text) or s.text,
+                metadata=s.metadata,
             )
             for s in chunk
         ]
