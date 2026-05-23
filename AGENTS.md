@@ -85,6 +85,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - `chunker.py` groups subtitles by time gap, then adaptive line/char limits; avoids splitting Q/A turns (`?`/`؟` followed by dash-prefixed reply)
 - `translator.py` owns prompt construction, provider abstraction, retries, correction prompts, optional refinement, cache integration, multiline restoration, metadata preservation, per-line reading-speed (CPS) budget enforcement, kind-aware payload routing, the one-shot register probe, and batched-parallel processing when rolling memory is enabled
 - `memory.py` holds the rolling story summary (`StoryMemory`) and its provider-driven update step
+- `discover.py` heuristically extracts proper-noun candidates from source subtitles and asks the provider for translations; `glossary.extend()` merges them in and `glossary.check_compliance()` powers the per-line retry
 - `postprocess.py` applies Persian-specific cleanup after translation
 - `cache.py` persists source-text → translated-text mappings
 - `merger.py` flattens translated chunks and writes the final SRT or ASS file

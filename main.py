@@ -153,6 +153,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to glossary JSON file",
     )
     p.add_argument(
+        "--auto-glossary", action="store_true",
+        help="Auto-discover proper nouns and recurring terms, then ask the "
+             "provider for translations (merged with --glossary; user wins)",
+    )
+    p.add_argument(
         "--refine", action="store_true",
         help="Enable refinement pass for higher quality",
     )
@@ -233,6 +238,8 @@ def main() -> None:
         translator_cfg.max_concurrency = args.concurrency
     if args.glossary is not None:
         translator_cfg.glossary_path = args.glossary
+    if args.auto_glossary:
+        translator_cfg.auto_glossary = True
     if args.cache is not None:
         translator_cfg.cache_path = args.cache
     if args.refine:

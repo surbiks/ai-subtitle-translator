@@ -51,3 +51,33 @@ class Glossary:
     def find_relevant(self, text: str) -> dict[str, str]:
         """Return only glossary entries whose source term appears in the text."""
         return {k: v for k, v in self._entries.items() if k in text}
+
+    def extend(self, other: dict[str, str], user_wins: bool = True) -> int:
+        """Merge another term→translation map into this glossary.
+
+        When ``user_wins`` is True (the default), existing entries are preserved
+        on conflict — so an auto-discovered term never overrides a hand-picked
+        translation. Returns the number of new entries actually added.
+        """
+        added = 0
+        for term, translation in other.items():
+            term = term.strip()
+            translation = (translation or "").strip()
+            if not term or not translation:
+                continue
+            if term in self._entries and user_wins:
+                continue
+            if self._entries.get(term) == translation:
+                continue
+            self._entries[term] = translation
+            added += 1
+        return added
+
+    def check_compliance(self, source: str, translated: str) -> list[tuple[str, str]]:
+        """Return (term, expected_translation) pairs that appear in source but
+        not in the translated text. Empty list means full compliance."""
+        violations: list[tuple[str, str]] = []
+        for term, expected in self._entries.items():
+            if term and expected and term in source and expected not in translated:
+                violations.append((term, expected))
+        return violations

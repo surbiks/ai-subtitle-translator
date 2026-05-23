@@ -92,6 +92,9 @@ cp .env.sample .env
 | `MEMORY_UPDATE_INTERVAL` | Update the rolling summary every N chunks | `5` |
 | `AUTO_PROBE` | Run a one-shot register/tone probe before translation | `false` |
 | `REGISTER_OVERRIDE` | Manual film-context description (skips `AUTO_PROBE`) | -- |
+| `AUTO_GLOSSARY` | Auto-discover proper nouns + recurring terms and propose translations | `false` |
+| `AUTO_GLOSSARY_MIN_OCCURRENCES` | Minimum occurrences in source for a term to be a candidate | `3` |
+| `ENFORCE_GLOSSARY` | Re-translate lines that omit a required glossary term | `true` |
 
 ## Usage
 
@@ -195,6 +198,8 @@ CLI flags override `.env` values when provided.
    - Optional refinement pass for fluency improvement
    - Optional one-shot **register probe** (`AUTO_PROBE=true`) detects genre + tone from a sample and injects it into every system prompt; `REGISTER_OVERRIDE` skips the probe
    - Optional **rolling story summary** (`ENABLE_MEMORY=true`) keeps character/context continuity across long files — chunks process in batches of `MEMORY_UPDATE_INTERVAL`, summary updates between batches, translation cache is bypassed while active
+   - Optional **auto-glossary** (`AUTO_GLOSSARY=true` or `--auto-glossary`) discovers recurring proper nouns / terms in the source, asks the provider to propose translations, and merges them with any `--glossary` entries (user entries win)
+   - **Glossary compliance** (`ENFORCE_GLOSSARY=true`, default on): after the main translation, any line whose source contains a glossary term but whose translation omits the mapped value triggers one targeted retry
 5. **Post-process** -- Persian-specific normalization:
    - Half-space (nim-fasele) insertion for prefixes/suffixes
    - Latin-to-Persian punctuation conversion

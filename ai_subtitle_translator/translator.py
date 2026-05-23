@@ -20,6 +20,7 @@ from typing import Any, Protocol
 from ai_subtitle_translator.cache import TranslationCache
 from ai_subtitle_translator.classify import LineKind, classify
 from ai_subtitle_translator.config import TranslatorConfig
+from ai_subtitle_translator.discover import extract_candidates, propose_translations
 from ai_subtitle_translator.glossary import Glossary
 from ai_subtitle_translator.memory import StoryMemory
 from ai_subtitle_translator.parser import Subtitle
@@ -279,6 +280,10 @@ class Translator:
         if contexts is None:
             contexts = [None] * len(chunks)
 
+        # Auto-discover glossary terms from the source (Phase 3.1).
+        if self._cfg.auto_glossary:
+            await self._discover_glossary(chunks)
+
         # One-shot register probe (skipped if register_override was set or
         # auto_probe is off).
         if self._cfg.auto_probe and not self._film_context:
@@ -345,6 +350,124 @@ class Translator:
 
         return translated
 
+    async def _discover_glossary(self, chunks: list[list[Subtitle]]) -> None:
+        """Extract candidate terms from source text, ask the provider for
+        translations, and merge non-conflicting entries into the active
+        glossary. User entries always win."""
+        all_subs = [s for chunk in chunks for s in chunk]
+        candidates = extract_candidates(
+            all_subs, self._cfg.auto_glossary_min_occurrences,
+        )
+        if not candidates:
+            logger.info("Auto-glossary: no candidate terms found")
+            return
+
+        preview = ", ".join(candidates[:5])
+        more = f", … (+{len(candidates) - 5})" if len(candidates) > 5 else ""
+        logger.info("Auto-glossary: %d candidate terms (%s%s)", len(candidates), preview, more)
+
+        proposed = await propose_translations(
+            self._provider, self._model, self._cfg.target_language, candidates,
+        )
+        if not proposed:
+            logger.info("Auto-glossary: no translations returned")
+            return
+
+        if self._glossary is None:
+            self._glossary = Glossary()
+        added = self._glossary.extend(proposed, user_wins=True)
+        if added > 0:
+            logger.info("Auto-glossary: added %d new entries", added)
+            self._system_prompt = _build_system_prompt(
+                self._cfg.target_language, self._glossary, self._film_context,
+            )
+        else:
+            logger.info("Auto-glossary: all proposed terms already present")
+
+    async def _enforce_glossary(
+        self,
+        index: int,
+        chunk: list[Subtitle],
+        items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """One targeted retry for translations that omit required glossary terms."""
+        if self._glossary is None or self._glossary.is_empty:
+            return items
+        chunk_by_id = {s.id: s for s in chunk}
+
+        violations: list[dict[str, Any]] = []
+        for item in items:
+            try:
+                item_id = int(item["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            orig = chunk_by_id.get(item_id)
+            text = item.get("text")
+            if orig is None or not isinstance(text, str):
+                continue
+            missing = self._glossary.check_compliance(orig.text, text)
+            if missing:
+                violations.append({
+                    "id": item_id,
+                    "current": text,
+                    "required_terms": [
+                        {"term": t, "must_use": e} for t, e in missing
+                    ],
+                })
+
+        if not violations:
+            return items
+
+        logger.info(
+            "Chunk %d: %d translations missing glossary terms — requesting fix",
+            index, len(violations),
+        )
+        fix_msg = (
+            "These translations did not use the required glossary terms. "
+            "Re-translate each item, using EVERY listed glossary term EXACTLY "
+            "as given in 'must_use'. Preserve meaning otherwise and respect "
+            'the same max_chars budget. Output ONLY a JSON array of '
+            '{"id": int, "text": string}.\n\n'
+            + json.dumps(violations, ensure_ascii=False)
+        )
+        try:
+            content = await self._provider.chat(
+                system=self._system_prompt,
+                messages=[{"role": "user", "content": fix_msg}],
+                model=self._model,
+                temperature=self._temperature,
+            )
+            revised = _parse_response(content, len(violations))
+        except Exception as exc:
+            logger.warning(
+                "Chunk %d: glossary retry failed (%s) — keeping non-compliant",
+                index, exc,
+            )
+            return items
+
+        revised_by_id: dict[int, str] = {}
+        for r in revised:
+            try:
+                rid = int(r["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            rtext = r.get("text")
+            if isinstance(rtext, str) and rtext.strip():
+                revised_by_id[rid] = rtext
+
+        merged: list[dict[str, Any]] = []
+        for item in items:
+            try:
+                item_id = int(item["id"])
+            except (KeyError, TypeError, ValueError):
+                merged.append(item)
+                continue
+            if item_id in revised_by_id:
+                merged.append({"id": item_id, "text": revised_by_id[item_id]})
+            else:
+                merged.append(item)
+        return merged
+
     async def _probe_register(self, sample: list[Subtitle]) -> str:
         """Ask the model to summarize genre + register from a small sample."""
         sample_text = "\n".join(s.text for s in sample[:20] if s.text.strip())
@@ -409,6 +532,12 @@ class Translator:
             # One compression retry for over-budget translations.
             if self._cfg.enforce_cps:
                 translated_items = await self._enforce_cps_budget(
+                    index, chunk, translated_items
+                )
+
+            # One targeted retry for missing glossary terms (Phase 3.2).
+            if self._cfg.enforce_glossary and self._glossary is not None and not self._glossary.is_empty:
+                translated_items = await self._enforce_glossary(
                     index, chunk, translated_items
                 )
 

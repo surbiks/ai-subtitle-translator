@@ -70,6 +70,10 @@ class TranslatorConfig:
     memory_update_interval: int = _env_int("MEMORY_UPDATE_INTERVAL", 5)
     auto_probe: bool = _env_bool("AUTO_PROBE", False)
     register_override: str | None = _env("REGISTER_OVERRIDE")
+    # Glossary lifecycle (Phase 3)
+    auto_glossary: bool = _env_bool("AUTO_GLOSSARY", False)
+    auto_glossary_min_occurrences: int = _env_int("AUTO_GLOSSARY_MIN_OCCURRENCES", 3)
+    enforce_glossary: bool = _env_bool("ENFORCE_GLOSSARY", True)
 
 
 @dataclass
