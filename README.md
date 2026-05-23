@@ -88,6 +88,10 @@ cp .env.sample .env
 | `CPS_TOLERANCE` | Multiplier before flagging a line as over budget | `1.2` |
 | `TRANSLATE_CUES` | Translate `[sound]` and `(action)` cues | `true` |
 | `TRANSLATE_LYRICS` | Translate `♪ lyrics ♪` lines | `true` |
+| `ENABLE_MEMORY` | Maintain a rolling story summary across chunks (bypasses cache) | `false` |
+| `MEMORY_UPDATE_INTERVAL` | Update the rolling summary every N chunks | `5` |
+| `AUTO_PROBE` | Run a one-shot register/tone probe before translation | `false` |
+| `REGISTER_OVERRIDE` | Manual film-context description (skips `AUTO_PROBE`) | -- |
 
 ## Usage
 
@@ -189,6 +193,8 @@ CLI flags override `.env` values when provided.
    - Smart retry: on invalid JSON, sends a correction prompt to the model
    - CPS retry: if any line exceeds its char budget, sends one compression request for the offenders
    - Optional refinement pass for fluency improvement
+   - Optional one-shot **register probe** (`AUTO_PROBE=true`) detects genre + tone from a sample and injects it into every system prompt; `REGISTER_OVERRIDE` skips the probe
+   - Optional **rolling story summary** (`ENABLE_MEMORY=true`) keeps character/context continuity across long files — chunks process in batches of `MEMORY_UPDATE_INTERVAL`, summary updates between batches, translation cache is bypassed while active
 5. **Post-process** -- Persian-specific normalization:
    - Half-space (nim-fasele) insertion for prefixes/suffixes
    - Latin-to-Persian punctuation conversion

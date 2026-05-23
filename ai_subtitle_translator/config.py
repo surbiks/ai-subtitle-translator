@@ -65,6 +65,11 @@ class TranslatorConfig:
     # Line-kind handling
     translate_cues: bool = _env_bool("TRANSLATE_CUES", True)
     translate_lyrics: bool = _env_bool("TRANSLATE_LYRICS", True)
+    # Run-level state (Phase 2)
+    enable_memory: bool = _env_bool("ENABLE_MEMORY", False)
+    memory_update_interval: int = _env_int("MEMORY_UPDATE_INTERVAL", 5)
+    auto_probe: bool = _env_bool("AUTO_PROBE", False)
+    register_override: str | None = _env("REGISTER_OVERRIDE")
 
 
 @dataclass

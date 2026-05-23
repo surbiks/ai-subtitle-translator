@@ -21,6 +21,7 @@ from ai_subtitle_translator.cache import TranslationCache
 from ai_subtitle_translator.classify import LineKind, classify
 from ai_subtitle_translator.config import TranslatorConfig
 from ai_subtitle_translator.glossary import Glossary
+from ai_subtitle_translator.memory import StoryMemory
 from ai_subtitle_translator.parser import Subtitle
 from ai_subtitle_translator.postprocess import postprocess_persian
 
@@ -32,8 +33,16 @@ logger = logging.getLogger(__name__)
 def _build_system_prompt(
     language: str,
     glossary: Glossary | None = None,
+    film_context: str = "",
 ) -> str:
     glossary_section = glossary.build_prompt_section() if glossary and not glossary.is_empty else ""
+    context_section = ""
+    if film_context.strip():
+        context_section = (
+            "\n\nFILM CONTEXT:\n"
+            f"{film_context.strip()}\n"
+            f"Tune register, tone, and word choice to fit this context consistently."
+        )
 
     return f"""You are a professional subtitle translator specializing in {language}.
 
@@ -80,7 +89,7 @@ LENGTH BUDGET:
 - Some items have "max_chars". The translation MUST fit within that budget.
 - Compress aggressively when needed: drop fillers ("you know", "well", "I
   mean"), contract clauses, use shorter synonyms.
-- Meaning preservation > literal preservation.{glossary_section}
+- Meaning preservation > literal preservation.{glossary_section}{context_section}
 
 INPUT:
 JSON array of subtitle objects with "id" and "text" fields, plus optional
@@ -93,9 +102,13 @@ JSON array with the same "id" fields and translated "text" fields. Nothing else.
 def _build_user_message(
     payload: list[dict[str, Any]],
     context: list[Subtitle] | None = None,
+    memory_block: str = "",
 ) -> str:
-    """Build user message with optional previous-chunk context."""
+    """Build user message with optional rolling-summary and previous-chunk context."""
     parts: list[str] = []
+
+    if memory_block:
+        parts.append(memory_block)
 
     if context:
         ctx_lines = [f'  - [{s.id}] "{s.text}"' for s in context]
@@ -108,6 +121,13 @@ def _build_user_message(
     parts.append("Translate the following:\n" + json.dumps(payload, ensure_ascii=False))
     return "\n".join(parts)
 
+
+_PROBE_PROMPT = (
+    "Given these subtitle lines from a film, in 2 short lines describe "
+    "(1) genre / setting and (2) register (formal, conversational, period, "
+    "slangy, poetic, technical, etc.). Be concrete and brief — these notes "
+    "tune a downstream translator."
+)
 
 _REFINEMENT_PROMPT = """You are a Persian subtitle editor. Improve this translated subtitle text:
 - Make it more natural and conversational
@@ -235,8 +255,14 @@ class Translator:
             self._model = self._cfg.model
             self._temperature = self._cfg.temperature
 
+        # Run-level state (Phase 2)
+        self._memory: StoryMemory | None = (
+            StoryMemory() if self._cfg.enable_memory else None
+        )
+        self._film_context: str = (self._cfg.register_override or "").strip()
+
         self._system_prompt = _build_system_prompt(
-            self._cfg.target_language, glossary
+            self._cfg.target_language, glossary, self._film_context,
         )
 
     @property
@@ -248,10 +274,27 @@ class Translator:
         chunks: list[list[Subtitle]],
         contexts: list[list[Subtitle] | None] | None = None,
     ) -> list[list[Subtitle]]:
-        """Translate all chunks in parallel (bounded by semaphore)."""
+        """Translate all chunks, optionally with a one-shot register probe and
+        a rolling story summary updated every N chunks."""
         if contexts is None:
             contexts = [None] * len(chunks)
 
+        # One-shot register probe (skipped if register_override was set or
+        # auto_probe is off).
+        if self._cfg.auto_probe and not self._film_context:
+            sample = [s for chunk in chunks[:3] for s in chunk]
+            probed = await self._probe_register(sample)
+            if probed:
+                self._film_context = probed
+                self._system_prompt = _build_system_prompt(
+                    self._cfg.target_language, self._glossary, self._film_context,
+                )
+                logger.info("Detected film register: %s", probed.replace("\n", " | "))
+
+        if self._memory is not None:
+            return await self._translate_in_batches(chunks, contexts)
+
+        # Full-parallel path (memory disabled).
         tasks = [
             self._translate_chunk(i, chunk, contexts[i])
             for i, chunk in enumerate(chunks)
@@ -268,11 +311,68 @@ class Translator:
 
         return translated
 
+    async def _translate_in_batches(
+        self,
+        chunks: list[list[Subtitle]],
+        contexts: list[list[Subtitle] | None],
+    ) -> list[list[Subtitle]]:
+        """Batched-parallel: translate N chunks sharing the current summary,
+        then fold that batch's source text into the summary before the next."""
+        assert self._memory is not None
+        batch_size = max(1, self._cfg.memory_update_interval)
+        translated: list[list[Subtitle]] = []
+
+        for start in range(0, len(chunks), batch_size):
+            end = min(start + batch_size, len(chunks))
+            memory_block = self._memory.context_block()
+            tasks = [
+                self._translate_chunk(i, chunks[i], contexts[i], memory_block=memory_block)
+                for i in range(start, end)
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for offset, result in enumerate(results):
+                idx = start + offset
+                if isinstance(result, Exception):
+                    logger.error("Chunk %d failed permanently: %s", idx, result)
+                    translated.append(chunks[idx])
+                else:
+                    translated.append(result)
+
+            batch_subs = [s for i in range(start, end) for s in chunks[i]]
+            await self._memory.update(
+                self._provider, self._model, batch_subs, temperature=0.0,
+            )
+
+        return translated
+
+    async def _probe_register(self, sample: list[Subtitle]) -> str:
+        """Ask the model to summarize genre + register from a small sample."""
+        sample_text = "\n".join(s.text for s in sample[:20] if s.text.strip())
+        if not sample_text:
+            return ""
+        try:
+            response = await self._provider.chat(
+                system="You are a translation prep assistant.",
+                messages=[{
+                    "role": "user",
+                    "content": f"{_PROBE_PROMPT}\n\nLines:\n{sample_text}",
+                }],
+                model=self._model,
+                temperature=0.0,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Register probe failed (%s) — proceeding without film context", exc,
+            )
+            return ""
+        return response.strip()
+
     async def _translate_chunk(
         self,
         index: int,
         chunk: list[Subtitle],
         context: list[Subtitle] | None,
+        memory_block: str = "",
     ) -> list[Subtitle]:
         """Translate a single chunk with semaphore, cache, retry, and post-processing."""
         async with self._semaphore:
@@ -286,14 +386,18 @@ class Translator:
                 logger.info("Chunk %d: no translatable lines, preserving all", index)
                 return [self._copy_with_text(s, s.text) for s in chunk]
 
-            # Cache fast path — only consider items we actually translate.
-            all_cached = all(self._cache.has(s.text) for s in items_to_translate)
-            if all_cached:
-                logger.info("Chunk %d fully cached, skipping API call", index)
-                return self._build_from_cache(chunk, kinds, translate_mask)
+            # Cache is bypassed entirely when rolling memory is on: cached
+            # translations don't account for the current summary state.
+            use_cache = self._memory is None
+
+            if use_cache:
+                all_cached = all(self._cache.has(s.text) for s in items_to_translate)
+                if all_cached:
+                    logger.info("Chunk %d fully cached, skipping API call", index)
+                    return self._build_from_cache(chunk, kinds, translate_mask)
 
             payload = self._build_payload(chunk, kinds, translate_mask)
-            user_msg = _build_user_message(payload, context)
+            user_msg = _build_user_message(payload, context, memory_block=memory_block)
             translated_items = await self._call_with_retry_and_correction(
                 index, user_msg, len(payload)
             )
@@ -337,7 +441,8 @@ class Translator:
                 if "\n" in orig.text:
                     translated_text = _restore_multiline(translated_text, orig.text)
 
-                self._cache.put(orig.text, translated_text)
+                if use_cache:
+                    self._cache.put(orig.text, translated_text)
                 result.append(self._copy_with_text(orig, translated_text))
 
             return result

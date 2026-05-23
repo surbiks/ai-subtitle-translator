@@ -83,7 +83,8 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - `parser.py` parses SRT and ASS into `SubtitleDocument`; ASS parsing preserves original file lines, dialogue metadata, and the `Name` field as `Subtitle.speaker`
 - `classify.py` labels each line as DIALOG / SOUND_CUE / STAGE_DIR / SCREEN_TEXT / LYRICS via regex
 - `chunker.py` groups subtitles by time gap, then adaptive line/char limits; avoids splitting Q/A turns (`?`/`؟` followed by dash-prefixed reply)
-- `translator.py` owns prompt construction, provider abstraction, retries, correction prompts, optional refinement, cache integration, multiline restoration, metadata preservation, per-line reading-speed (CPS) budget enforcement, and kind-aware payload routing
+- `translator.py` owns prompt construction, provider abstraction, retries, correction prompts, optional refinement, cache integration, multiline restoration, metadata preservation, per-line reading-speed (CPS) budget enforcement, kind-aware payload routing, the one-shot register probe, and batched-parallel processing when rolling memory is enabled
+- `memory.py` holds the rolling story summary (`StoryMemory`) and its provider-driven update step
 - `postprocess.py` applies Persian-specific cleanup after translation
 - `cache.py` persists source-text → translated-text mappings
 - `merger.py` flattens translated chunks and writes the final SRT or ASS file
