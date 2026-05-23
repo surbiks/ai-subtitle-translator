@@ -139,7 +139,12 @@ class _OpenAIProvider:
 class _AnthropicProvider:
     """Anthropic Claude provider."""
 
-    def __init__(self, api_key: str | None, base_url: str | None) -> None:
+    def __init__(
+        self,
+        api_key: str | None,
+        base_url: str | None,
+        max_tokens: int = 4096,
+    ) -> None:
         from anthropic import AsyncAnthropic
 
         kwargs: dict[str, Any] = {}
@@ -148,6 +153,7 @@ class _AnthropicProvider:
         if base_url:
             kwargs["base_url"] = base_url
         self._client = AsyncAnthropic(**kwargs)
+        self._max_tokens = max_tokens
 
     async def chat(
         self,
@@ -158,7 +164,7 @@ class _AnthropicProvider:
     ) -> str:
         response = await self._client.messages.create(
             model=model,
-            max_tokens=4096,
+            max_tokens=self._max_tokens,
             temperature=temperature,
             system=system,
             messages=messages,  # type: ignore[arg-type]
@@ -169,7 +175,11 @@ class _AnthropicProvider:
 def _build_provider(config: TranslatorConfig) -> _ChatProvider:
     """Create the appropriate provider based on config."""
     if config.provider == "anthropic":
-        return _AnthropicProvider(api_key=config.anthropic_api_key, base_url=config.anthropic_base_url)
+        return _AnthropicProvider(
+            api_key=config.anthropic_api_key,
+            base_url=config.anthropic_base_url,
+            max_tokens=config.anthropic_max_tokens,
+        )
     return _OpenAIProvider(api_key=config.api_key, base_url=config.base_url)
 
 
@@ -255,10 +265,23 @@ class Translator:
             if self._cfg.enable_refinement:
                 translated_items = await self._refine(index, translated_items)
 
+            # Align translations back to the original chunk by id (not position).
+            # The model may drop, duplicate, or reorder items; positional zip
+            # would silently misalign translations to the wrong subtitle.
+            by_id: dict[int, str] = {}
+            for item in translated_items:
+                try:
+                    item_id = int(item["id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    by_id[item_id] = text
+
             # Build result with post-processing
             result: list[Subtitle] = []
-            for orig, trans in zip(chunk, translated_items):
-                translated_text = trans.get("text", orig.text)
+            for orig in chunk:
+                translated_text = by_id.get(orig.id, orig.text)
 
                 # Apply Persian post-processing if target is Persian
                 if "persian" in self._cfg.target_language.lower() or "farsi" in self._cfg.target_language.lower():

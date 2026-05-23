@@ -7,9 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-# Matches "HH:MM:SS,mmm --> HH:MM:SS,mmm"
+# Matches "HH:MM:SS,mmm --> HH:MM:SS,mmm" (also tolerates "." as the fraction separator)
 _SRT_TIMESTAMP_RE = re.compile(
-    r"(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})"
+    r"(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})"
 )
 _GENERIC_TIMESTAMP_RE = re.compile(
     r"(?P<h>\d+):(?P<m>\d{2}):(?P<s>\d{2})[,.](?P<f>\d{2,3})"

@@ -60,11 +60,14 @@ _PUNCTUATION_MAP = {
 }
 
 
+# Skip conversion when the punctuation sits inside a Latin/digit run, so things
+# like "Netflix, Inc." or "v1.2" survive unchanged.
+_PUNCTUATION_RE = re.compile(r"(?<![A-Za-z0-9])([?,;])(?![A-Za-z0-9])")
+
+
 def convert_punctuation(text: str) -> str:
-    """Replace Latin punctuation with Persian equivalents."""
-    for latin, persian in _PUNCTUATION_MAP.items():
-        text = text.replace(latin, persian)
-    return text
+    """Replace Latin punctuation with Persian equivalents (outside Latin runs)."""
+    return _PUNCTUATION_RE.sub(lambda m: _PUNCTUATION_MAP[m.group(1)], text)
 
 
 # -- Formal → conversational replacements --

@@ -69,6 +69,7 @@ cp .env.sample .env
 | `ANTHROPIC_BASE_URL` | Anthropic API base URL (for proxies) | -- |
 | `ANTHROPIC_MODEL` | Anthropic model to use | `claude-sonnet-4-20250514` |
 | `ANTHROPIC_TEMPERATURE` | Anthropic sampling temperature | `0.3` |
+| `ANTHROPIC_MAX_TOKENS` | Anthropic max output tokens per request | `4096` |
 | `TARGET_LANGUAGE` | Target translation language | `Persian (Farsi)` |
 | `ENABLE_REFINEMENT` | Enable second-pass quality improvement | `false` |
 | `ENABLE_POSTPROCESS` | Enable Persian post-processing | `true` |

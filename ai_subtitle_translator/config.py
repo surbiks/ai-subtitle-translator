@@ -48,6 +48,7 @@ class TranslatorConfig:
     anthropic_base_url: str | None = _env("ANTHROPIC_BASE_URL")
     anthropic_model: str = _env("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")  # type: ignore[assignment]
     anthropic_temperature: float = _env_float("ANTHROPIC_TEMPERATURE", 0.3)
+    anthropic_max_tokens: int = _env_int("ANTHROPIC_MAX_TOKENS", 4096)
     max_concurrency: int = _env_int("MAX_CONCURRENCY", 5)
     max_retries: int = _env_int("MAX_RETRIES", 3)
     retry_base_delay: float = _env_float("RETRY_BASE_DELAY", 1.0)
