@@ -15,8 +15,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any, Protocol
 
+from ai_subtitle_translator.ass_tags import has_tags, restore_tags, strip_tags
 from ai_subtitle_translator.cache import TranslationCache
 from ai_subtitle_translator.classify import LineKind, classify
 from ai_subtitle_translator.config import TranslatorConfig
@@ -130,14 +132,30 @@ _PROBE_PROMPT = (
     "tune a downstream translator."
 )
 
-_REFINEMENT_PROMPT = """You are a Persian subtitle editor. Improve this translated subtitle text:
-- Make it more natural and conversational
-- Fix any awkward phrasing
-- Keep it concise for subtitle readability
-- Do NOT change the JSON structure
+_CRITIQUE_SYSTEM_PROMPT = (
+    "You are a {language} subtitle editor. Identify SPECIFIC issues only. "
+    "Do not rewrite. Do not praise. Be terse."
+)
 
-Input and output: JSON array of {{"id": int, "text": string}}.
-Return ONLY the improved JSON array."""
+_CRITIQUE_USER_PROMPT = (
+    "Find issues in these translations (naturalness, register, length, "
+    "glossary, awkward phrasing). Output a JSON array of "
+    '{{"id": int, "issues": [string]}} for items with problems. '
+    "Empty array if all are fine.\n\n"
+    "{payload}"
+)
+
+_REVISE_SYSTEM_PROMPT = (
+    "You revise {language} subtitles given specific criticism. Apply every "
+    "flagged fix, change nothing else, preserve item ids exactly."
+)
+
+_REVISE_USER_PROMPT = (
+    "Original translations:\n{items}\n\n"
+    "Criticism:\n{critique}\n\n"
+    "Output the revised JSON array of {{\"id\": int, \"text\": string}}, "
+    "same ids, fixing every flagged issue. JSON only."
+)
 
 _CORRECTION_PROMPT = (
     "Your previous output was not valid JSON. "
@@ -519,7 +537,20 @@ class Translator:
                     logger.info("Chunk %d fully cached, skipping API call", index)
                     return self._build_from_cache(chunk, kinds, translate_mask)
 
-            payload = self._build_payload(chunk, kinds, translate_mask)
+            # Pre-strip ASS override tags so the model only sees visible text.
+            # The tag map is kept per-id so we can restore tags at the end.
+            ass_meta_by_id: dict[int, tuple[list[tuple[int, str]], int]] = {}
+            text_overrides: dict[int, str] = {}
+            for s in items_to_translate:
+                if has_tags(s.text):
+                    clean, tags = strip_tags(s.text)
+                    ass_meta_by_id[s.id] = (tags, len(clean))
+                    text_overrides[s.id] = clean
+
+            payload = self._build_payload(
+                chunk, kinds, translate_mask,
+                text_overrides=text_overrides or None,
+            )
             user_msg = _build_user_message(payload, context, memory_block=memory_block)
             translated_items = await self._call_with_retry_and_correction(
                 index, user_msg, len(payload)
@@ -570,6 +601,11 @@ class Translator:
                 if "\n" in orig.text:
                     translated_text = _restore_multiline(translated_text, orig.text)
 
+                meta = ass_meta_by_id.get(orig.id)
+                if meta is not None:
+                    tags, clean_len = meta
+                    translated_text = restore_tags(translated_text, tags, clean_len)
+
                 if use_cache:
                     self._cache.put(orig.text, translated_text)
                 result.append(self._copy_with_text(orig, translated_text))
@@ -602,12 +638,15 @@ class Translator:
         chunk: list[Subtitle],
         kinds: list[LineKind],
         translate_mask: list[bool],
+        text_overrides: dict[int, str] | None = None,
     ) -> list[dict[str, Any]]:
+        overrides = text_overrides or {}
         payload: list[dict[str, Any]] = []
         for s, kind, m in zip(chunk, kinds, translate_mask):
             if not m:
                 continue
-            item: dict[str, Any] = {"id": s.id, "text": s.text.replace("\n", " ")}
+            src = overrides.get(s.id, s.text)
+            item: dict[str, Any] = {"id": s.id, "text": src.replace("\n", " ")}
             if s.speaker:
                 item["speaker"] = s.speaker
             if kind != LineKind.DIALOG:
@@ -775,21 +814,56 @@ class Translator:
     async def _refine(
         self, chunk_index: int, items: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Optional second pass: send translations back for fluency improvement."""
+        """Two-step refinement: critique the translations, then revise only
+        the items the critique flagged. If the critique is empty, skip the
+        revise call entirely."""
+        if not items:
+            return items
+
+        lang = self._cfg.target_language
+        items_json = json.dumps(items, ensure_ascii=False)
+
         try:
-            logger.info("Chunk %d: refinement pass", chunk_index)
-            payload = json.dumps(items, ensure_ascii=False)
-            content = await self._provider.chat(
-                system=_REFINEMENT_PROMPT,
-                messages=[{"role": "user", "content": payload}],
+            logger.info("Chunk %d: refinement critique", chunk_index)
+            critique = await self._provider.chat(
+                system=_CRITIQUE_SYSTEM_PROMPT.format(language=lang),
+                messages=[{
+                    "role": "user",
+                    "content": _CRITIQUE_USER_PROMPT.format(payload=items_json),
+                }],
+                model=self._model,
+                temperature=0.0,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Chunk %d: critique failed (%s) — skipping refinement", chunk_index, exc,
+            )
+            return items
+
+        if _critique_is_empty(critique):
+            logger.info("Chunk %d: critique returned no issues — keeping items", chunk_index)
+            return items
+
+        try:
+            logger.info("Chunk %d: refinement revise", chunk_index)
+            revised_raw = await self._provider.chat(
+                system=_REVISE_SYSTEM_PROMPT.format(language=lang),
+                messages=[{
+                    "role": "user",
+                    "content": _REVISE_USER_PROMPT.format(
+                        items=items_json, critique=critique.strip(),
+                    ),
+                }],
                 model=self._model,
                 temperature=self._temperature,
             )
-            refined = _parse_response(content, len(items))
-            logger.info("Chunk %d: refinement successful", chunk_index)
-            return refined
+            revised = _parse_response(revised_raw, len(items))
+            logger.info("Chunk %d: refinement applied", chunk_index)
+            return revised
         except Exception as exc:
-            logger.warning("Chunk %d: refinement failed (%s), using original", chunk_index, exc)
+            logger.warning(
+                "Chunk %d: revise failed (%s) — keeping original items", chunk_index, exc,
+            )
             return items
 
     def _build_from_cache(
@@ -814,6 +888,37 @@ class Translator:
 
 
 # -- Helpers --
+
+
+def _critique_is_empty(raw: str) -> bool:
+    """True when the critique step returned no actionable issues."""
+    text = raw.strip()
+    if not text:
+        return True
+    if text.startswith("```"):
+        lines = [ln for ln in text.splitlines() if not ln.strip().startswith("```")]
+        text = "\n".join(lines).strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("[")
+        end = text.rfind("]")
+        if start == -1 or end == -1:
+            return False
+        try:
+            data = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return False
+    if isinstance(data, list):
+        if len(data) == 0:
+            return True
+        # Treat items with no real issues list as a no-op too.
+        return all(
+            isinstance(item, dict)
+            and not [i for i in (item.get("issues") or []) if str(i).strip()]
+            for item in data
+        )
+    return False
 
 
 def _parse_response(raw: str, expected_count: int) -> list[dict[str, Any]]:
@@ -857,23 +962,48 @@ def _parse_response(raw: str, expected_count: int) -> list[dict[str, Any]]:
     return data
 
 
-def _restore_multiline(translated: str, original: str) -> str:
-    """
-    If the original subtitle was multi-line, try to split the translated
-    text into the same number of lines (split roughly by midpoint).
-    """
-    original_lines = original.split("\n")
-    n_lines = len(original_lines)
+_CLAUSE_BREAK_RE = re.compile(r"[،؛.,;:]\s")
 
+
+def _restore_multiline(translated: str, original: str) -> str:
+    """Restore the original line count, preferring clause-boundary splits
+    (Persian or Latin punctuation followed by whitespace). Falls back to an
+    even word-count split when there aren't enough clause breaks to honor."""
+    n_lines = original.count("\n") + 1
     if n_lines <= 1:
         return translated
 
-    # Split translated text into roughly equal parts
+    candidates = [m.end() for m in _CLAUSE_BREAK_RE.finditer(translated)]
+    if len(candidates) < n_lines - 1:
+        return _split_by_words(translated, n_lines)
+
+    # Pick the n-1 split points whose positions are closest to even spacing.
+    target_lengths = [len(translated) * i // n_lines for i in range(1, n_lines)]
+    chosen: list[int] = []
+    remaining = list(candidates)
+    for target in target_lengths:
+        best = min(remaining, key=lambda c: abs(c - target))
+        chosen.append(best)
+        remaining.remove(best)
+    chosen.sort()
+
+    lines: list[str] = []
+    prev = 0
+    for split in chosen:
+        lines.append(translated[prev:split].strip())
+        prev = split
+    lines.append(translated[prev:].strip())
+
+    lines = [ln for ln in lines if ln]
+    return "\n".join(lines) if lines else translated
+
+
+def _split_by_words(translated: str, n_lines: int) -> str:
+    """Even word-count split — fallback when clause boundaries don't exist."""
     words = translated.split()
     if len(words) <= 1:
         return translated
 
-    # Distribute words across lines as evenly as possible
     per_line = max(1, len(words) // n_lines)
     lines: list[str] = []
     for i in range(n_lines):
@@ -883,6 +1013,5 @@ def _restore_multiline(translated: str, original: str) -> str:
         else:
             lines.append(" ".join(words[start : start + per_line]))
 
-    # Filter out empty lines
     lines = [ln for ln in lines if ln]
     return "\n".join(lines) if lines else translated

@@ -195,7 +195,8 @@ CLI flags override `.env` values when provided.
    - Line kind tag (dialog / sound_cue / stage_dir / screen_text / lyrics) with kind-specific instructions
    - Smart retry: on invalid JSON, sends a correction prompt to the model
    - CPS retry: if any line exceeds its char budget, sends one compression request for the offenders
-   - Optional refinement pass for fluency improvement
+   - Optional **two-step refinement** (`--refine` / `ENABLE_REFINEMENT=true`): the model first critiques each translation, then revises only the items it flagged. Empty critique short-circuits the revise call.
+   - ASS inline-style preservation: `{\i1}`, `{\b1}`, `{\pos(...)}` etc. are stripped before translation and restored onto the translated text (inline tags positioned proportionally, positional tags reattached at line start)
    - Optional one-shot **register probe** (`AUTO_PROBE=true`) detects genre + tone from a sample and injects it into every system prompt; `REGISTER_OVERRIDE` skips the probe
    - Optional **rolling story summary** (`ENABLE_MEMORY=true`) keeps character/context continuity across long files — chunks process in batches of `MEMORY_UPDATE_INTERVAL`, summary updates between batches, translation cache is bypassed while active
    - Optional **auto-glossary** (`AUTO_GLOSSARY=true` or `--auto-glossary`) discovers recurring proper nouns / terms in the source, asks the provider to propose translations, and merges them with any `--glossary` entries (user entries win)
@@ -205,6 +206,7 @@ CLI flags override `.env` values when provided.
    - Latin-to-Persian punctuation conversion
    - Formal-to-conversational phrase simplification
 6. **Multi-line** -- joins multi-line text before translation, restores line structure after
+   - Restore prefers Persian/Latin clause boundaries (`،؛.,;:`) for split points; falls back to even word-count distribution
    - SRT line breaks are preserved as real newlines
    - ASS line breaks are decoded from `\N` / `\n` and restored on write
 7. **Cache** -- caches source→translated pairs; optionally persists between runs
