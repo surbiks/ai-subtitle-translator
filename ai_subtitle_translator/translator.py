@@ -18,6 +18,7 @@ import logging
 from typing import Any, Protocol
 
 from ai_subtitle_translator.cache import TranslationCache
+from ai_subtitle_translator.classify import LineKind, classify
 from ai_subtitle_translator.config import TranslatorConfig
 from ai_subtitle_translator.glossary import Glossary
 from ai_subtitle_translator.parser import Subtitle
@@ -53,10 +54,37 @@ STYLE:
 - Use modern spoken {language}
 - Avoid formal/literary tone
 - Keep sentences short and natural
-- Make it sound like {language} movie subtitles{glossary_section}
+- Make it sound like {language} movie subtitles
+
+SPEAKER CONSISTENCY:
+- Some items include a "speaker" field (character name).
+- Maintain a consistent register (formal vs informal) per speaker across the
+  ENTIRE file. Pick register from relationship cues in the dialog
+  (boss/employee → formal, friends → informal, parent → child → mixed).
+- Never switch register for the same speaker mid-conversation unless the
+  source clearly signals it.
+- Within a single line, a leading dash ("-" / "–" / "—") marks a speaker
+  change between two turns. Translate each turn naturally and keep the dash.
+
+LINE KINDS (the "kind" field, default is dialog when absent):
+- "dialog" — translate naturally as spoken {language}.
+- "sound_cue" — bracketed sounds like [music]. Translate inside brackets,
+  e.g. [music] → [موسیقی]. Keep the brackets.
+- "stage_dir" — parenthetical action like (whispering). Translate inside the
+  parentheses. Keep the parentheses.
+- "screen_text" — on-screen text (signs, titles, captions). Translate
+  naturally without conversational softening.
+- "lyrics" — translate poetically; preserve any ♪ markers.
+
+LENGTH BUDGET:
+- Some items have "max_chars". The translation MUST fit within that budget.
+- Compress aggressively when needed: drop fillers ("you know", "well", "I
+  mean"), contract clauses, use shorter synonyms.
+- Meaning preservation > literal preservation.{glossary_section}
 
 INPUT:
-JSON array of subtitle objects with "id" and "text" fields.
+JSON array of subtitle objects with "id" and "text" fields, plus optional
+"speaker", "kind", and "max_chars" fields.
 
 OUTPUT:
 JSON array with the same "id" fields and translated "text" fields. Nothing else."""
@@ -248,22 +276,37 @@ class Translator:
     ) -> list[Subtitle]:
         """Translate a single chunk with semaphore, cache, retry, and post-processing."""
         async with self._semaphore:
-            # Check cache for every line
-            all_cached = all(self._cache.has(s.text) for s in chunk)
+            # Classify each line so we can route cues/lyrics differently and
+            # honor the user's translate_cues / translate_lyrics flags.
+            kinds = [classify(s.text) for s in chunk]
+            translate_mask = [self._should_translate(k) for k in kinds]
+            items_to_translate = [s for s, m in zip(chunk, translate_mask) if m]
+
+            if not items_to_translate:
+                logger.info("Chunk %d: no translatable lines, preserving all", index)
+                return [self._copy_with_text(s, s.text) for s in chunk]
+
+            # Cache fast path — only consider items we actually translate.
+            all_cached = all(self._cache.has(s.text) for s in items_to_translate)
             if all_cached:
                 logger.info("Chunk %d fully cached, skipping API call", index)
-                return self._build_from_cache(chunk)
+                return self._build_from_cache(chunk, kinds, translate_mask)
 
-            # Build payload (join multi-line text with space for cleaner translation)
-            payload = [{"id": s.id, "text": s.text.replace("\n", " ")} for s in chunk]
-
+            payload = self._build_payload(chunk, kinds, translate_mask)
             user_msg = _build_user_message(payload, context)
-            raw = await self._call_with_retry_and_correction(index, user_msg, len(chunk))
-            translated_items = raw  # already parsed
+            translated_items = await self._call_with_retry_and_correction(
+                index, user_msg, len(payload)
+            )
 
             # Refinement pass (optional)
             if self._cfg.enable_refinement:
                 translated_items = await self._refine(index, translated_items)
+
+            # One compression retry for over-budget translations.
+            if self._cfg.enforce_cps:
+                translated_items = await self._enforce_cps_budget(
+                    index, chunk, translated_items
+                )
 
             # Align translations back to the original chunk by id (not position).
             # The model may drop, duplicate, or reorder items; positional zip
@@ -280,27 +323,157 @@ class Translator:
 
             # Build result with post-processing
             result: list[Subtitle] = []
-            for orig in chunk:
+            for orig, will_translate in zip(chunk, translate_mask):
+                if not will_translate:
+                    # Cue/lyric the user opted out of translating — preserve source.
+                    result.append(self._copy_with_text(orig, orig.text))
+                    continue
+
                 translated_text = by_id.get(orig.id, orig.text)
 
-                # Apply Persian post-processing if target is Persian
-                if "persian" in self._cfg.target_language.lower() or "farsi" in self._cfg.target_language.lower():
+                if self._cfg.enable_postprocess and self._is_persian_target():
                     translated_text = postprocess_persian(translated_text)
 
-                # Restore multi-line structure if original was multi-line
                 if "\n" in orig.text:
                     translated_text = _restore_multiline(translated_text, orig.text)
 
                 self._cache.put(orig.text, translated_text)
-                result.append(Subtitle(
-                    id=orig.id,
-                    start=orig.start,
-                    end=orig.end,
-                    text=translated_text,
-                    metadata=orig.metadata,
-                ))
+                result.append(self._copy_with_text(orig, translated_text))
 
             return result
+
+    # -- Per-chunk helpers --
+
+    def _should_translate(self, kind: LineKind) -> bool:
+        if not self._cfg.translate_cues and kind in (
+            LineKind.SOUND_CUE, LineKind.STAGE_DIR,
+        ):
+            return False
+        if not self._cfg.translate_lyrics and kind == LineKind.LYRICS:
+            return False
+        return True
+
+    def _is_persian_target(self) -> bool:
+        lang = self._cfg.target_language.lower()
+        return "persian" in lang or "farsi" in lang
+
+    def _char_budget(self, sub: Subtitle) -> int:
+        """Per-line character budget derived from on-screen duration and CPS target."""
+        duration_sec = max(0.5, (sub.end_ms - sub.start_ms) / 1000.0)
+        budget = int(duration_sec * self._cfg.cps_target)
+        return max(self._cfg.cps_min_chars, budget)
+
+    def _build_payload(
+        self,
+        chunk: list[Subtitle],
+        kinds: list[LineKind],
+        translate_mask: list[bool],
+    ) -> list[dict[str, Any]]:
+        payload: list[dict[str, Any]] = []
+        for s, kind, m in zip(chunk, kinds, translate_mask):
+            if not m:
+                continue
+            item: dict[str, Any] = {"id": s.id, "text": s.text.replace("\n", " ")}
+            if s.speaker:
+                item["speaker"] = s.speaker
+            if kind != LineKind.DIALOG:
+                item["kind"] = kind.value
+            if self._cfg.enforce_cps:
+                item["max_chars"] = self._char_budget(s)
+            payload.append(item)
+        return payload
+
+    def _copy_with_text(self, orig: Subtitle, text: str) -> Subtitle:
+        return Subtitle(
+            id=orig.id,
+            start=orig.start,
+            end=orig.end,
+            text=text,
+            speaker=orig.speaker,
+            metadata=orig.metadata,
+        )
+
+    async def _enforce_cps_budget(
+        self,
+        index: int,
+        chunk: list[Subtitle],
+        items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """One compression retry for translations that exceed their char budget."""
+        chunk_by_id = {s.id: s for s in chunk}
+
+        overruns: list[dict[str, Any]] = []
+        for item in items:
+            try:
+                item_id = int(item["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            orig = chunk_by_id.get(item_id)
+            text = item.get("text")
+            if orig is None or not isinstance(text, str):
+                continue
+            budget = self._char_budget(orig)
+            visible_len = len(text.replace("‌", "").strip())
+            if visible_len > int(budget * self._cfg.cps_tolerance):
+                overruns.append({
+                    "id": item_id,
+                    "max_chars": budget,
+                    "current": text,
+                    "current_length": visible_len,
+                })
+
+        if not overruns:
+            return items
+
+        logger.info(
+            "Chunk %d: %d translations exceed budget — requesting compression",
+            index, len(overruns),
+        )
+
+        compression_msg = (
+            "The following translations exceed their max_chars budget. "
+            "Compress each one to fit, preserving meaning. Drop fillers, "
+            "use shorter synonyms, contract clauses. Output ONLY a JSON array "
+            'of {"id": int, "text": string} with the same ids.\n\n'
+            + json.dumps(overruns, ensure_ascii=False)
+        )
+        try:
+            content = await self._provider.chat(
+                system=self._system_prompt,
+                messages=[{"role": "user", "content": compression_msg}],
+                model=self._model,
+                temperature=self._temperature,
+            )
+            revised = _parse_response(content, len(overruns))
+        except Exception as exc:
+            logger.warning(
+                "Chunk %d: CPS compression failed (%s), keeping over-budget translations",
+                index, exc,
+            )
+            return items
+
+        revised_by_id: dict[int, str] = {}
+        for r in revised:
+            try:
+                rid = int(r["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            rtext = r.get("text")
+            if isinstance(rtext, str) and rtext.strip():
+                revised_by_id[rid] = rtext
+
+        merged: list[dict[str, Any]] = []
+        for item in items:
+            try:
+                item_id = int(item["id"])
+            except (KeyError, TypeError, ValueError):
+                merged.append(item)
+                continue
+            if item_id in revised_by_id:
+                merged.append({"id": item_id, "text": revised_by_id[item_id]})
+            else:
+                merged.append(item)
+        return merged
 
     async def _call_with_retry_and_correction(
         self,
@@ -318,6 +491,9 @@ class Translator:
         ]
 
         for attempt in range(1, self._cfg.max_retries + 1):
+            # Initialize so the parse_exc handler can reference `content` even
+            # if the chat call itself raises a ValueError before it's assigned.
+            content = ""
             try:
                 logger.info(
                     "Chunk %d: attempt %d/%d",
@@ -336,13 +512,17 @@ class Translator:
                 return items
 
             except (ValueError, json.JSONDecodeError) as parse_exc:
-                # JSON was invalid — ask model to correct
+                # JSON was invalid — ask model to correct.
+                # If content is empty here, the chat call itself failed; treat
+                # it as a transient error and retry without poisoning the message
+                # history with an empty assistant turn.
                 logger.warning(
                     "Chunk %d attempt %d: invalid JSON — sending correction prompt",
                     chunk_index, attempt,
                 )
-                messages.append({"role": "assistant", "content": content})
-                messages.append({"role": "user", "content": _CORRECTION_PROMPT})
+                if content:
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({"role": "user", "content": _CORRECTION_PROMPT})
                 last_exc = parse_exc
 
             except Exception as exc:
@@ -378,17 +558,25 @@ class Translator:
             logger.warning("Chunk %d: refinement failed (%s), using original", chunk_index, exc)
             return items
 
-    def _build_from_cache(self, chunk: list[Subtitle]) -> list[Subtitle]:
-        return [
-            Subtitle(
-                id=s.id,
-                start=s.start,
-                end=s.end,
-                text=self._cache.get(s.text) or s.text,
-                metadata=s.metadata,
-            )
-            for s in chunk
-        ]
+    def _build_from_cache(
+        self,
+        chunk: list[Subtitle],
+        kinds: list[LineKind] | None = None,
+        translate_mask: list[bool] | None = None,
+    ) -> list[Subtitle]:
+        if kinds is None:
+            kinds = [classify(s.text) for s in chunk]
+        if translate_mask is None:
+            translate_mask = [self._should_translate(k) for k in kinds]
+
+        result: list[Subtitle] = []
+        for orig, will_translate in zip(chunk, translate_mask):
+            if will_translate:
+                text = self._cache.get(orig.text) or orig.text
+            else:
+                text = orig.text
+            result.append(self._copy_with_text(orig, text))
+        return result
 
 
 # -- Helpers --

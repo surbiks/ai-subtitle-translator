@@ -82,6 +82,12 @@ cp .env.sample .env
 | `CHUNK_MAX_CHARS` | Max characters per chunk | `1500` |
 | `CHUNK_TIME_GAP_MS` | Time gap to split dialogues (milliseconds) | `2500` |
 | `CHUNK_CONTEXT_LINES` | Lines from previous chunk sent as context | `3` |
+| `ENFORCE_CPS` | Enforce per-line reading-speed budget (compresses overruns) | `true` |
+| `CPS_TARGET` | Target characters-per-second for the translated language | `13.0` |
+| `CPS_MIN_CHARS` | Minimum char budget for very short cues | `20` |
+| `CPS_TOLERANCE` | Multiplier before flagging a line as over budget | `1.2` |
+| `TRANSLATE_CUES` | Translate `[sound]` and `(action)` cues | `true` |
+| `TRANSLATE_LYRICS` | Translate `♪ lyrics ♪` lines | `true` |
 
 ## Usage
 
@@ -177,8 +183,11 @@ CLI flags override `.env` values when provided.
 4. **Translate** -- sends chunks to the selected provider (OpenAI or Anthropic) in parallel with:
    - Previous context injected in the prompt (not re-translated)
    - Glossary terms injected for consistency
-   - Concise-translation guidance for subtitle readability
+   - Per-line speaker tag (from ASS `Name` field) so register stays consistent per character
+   - Per-line `max_chars` budget derived from on-screen duration × CPS target
+   - Line kind tag (dialog / sound_cue / stage_dir / screen_text / lyrics) with kind-specific instructions
    - Smart retry: on invalid JSON, sends a correction prompt to the model
+   - CPS retry: if any line exceeds its char budget, sends one compression request for the offenders
    - Optional refinement pass for fluency improvement
 5. **Post-process** -- Persian-specific normalization:
    - Half-space (nim-fasele) insertion for prefixes/suffixes

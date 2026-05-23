@@ -22,6 +22,7 @@ class Subtitle:
     start: str
     end: str
     text: str
+    speaker: str | None = None
     metadata: dict[str, Any] | None = None
 
     @property
@@ -188,11 +189,15 @@ def _parse_ass_dialogue_line(
     prefix_parts = parts[:text_field_index]
     prefix = "Dialogue:" + ",".join(prefix_parts) + ","
 
+    speaker_raw = data.get("name", "").strip()
+    speaker = speaker_raw or None
+
     return Subtitle(
         id=dialogue_id,
         start=start,
         end=end,
         text=_decode_ass_text(text),
+        speaker=speaker,
         metadata={
             "ass_line_index": line_index,
             "ass_prefix": prefix,
