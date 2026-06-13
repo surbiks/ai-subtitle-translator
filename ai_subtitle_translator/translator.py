@@ -1,5 +1,5 @@
 """
-Async subtitle translator with multi-provider support (OpenAI & Anthropic).
+Async subtitle translator using the OpenAI API.
 
 Features:
 - Context-aware prompting (previous chunk as read-only context)
@@ -112,13 +112,82 @@ class _ChatProvider(Protocol):
     ) -> str: ...
 
 
-class _OpenAIProvider:
-    """OpenAI-compatible provider (works with any OpenAI-compatible endpoint)."""
+class ModelNotSupportedError(Exception):
+    """Raised when a model doesn't support the chat completions endpoint."""
 
-    def __init__(self, api_key: str | None, base_url: str | None) -> None:
+
+def _is_unsupported_model_error(exc: Exception) -> bool:
+    """Check if an API error indicates the model doesn't support the endpoint."""
+    err = getattr(exc, "body", None) or getattr(exc, "response", None)
+    if isinstance(exc, dict):
+        err = exc
+    if isinstance(err, dict):
+        code = str(err.get("code", ""))
+        message = str(err.get("message", ""))
+    elif isinstance(err, str):
+        code = ""
+        message = err
+    else:
+        code = str(getattr(err, "code", "") or "")
+        message = str(getattr(err, "message", "") or "") + str(exc)
+
+    return "unsupported_api_for_model" in code or "not accessible via" in message
+
+
+def _is_unsupported_temperature_error(exc: Exception) -> bool:
+    """Check if an API error indicates the model rejects an explicit temperature."""
+    msg = str(exc).lower()
+    if "temperature" not in msg:
+        return False
+    return (
+        "unsupported" in msg
+        or "does not support" in msg
+        or "only the default" in msg
+    )
+
+
+def _build_responses_input(
+    system: str, messages: list[dict[str, str]]
+) -> str:
+    """Convert chat messages to a single input string for the Responses API."""
+    parts: list[str] = []
+    if system:
+        parts.append(f"System: {system}")
+    for msg in messages:
+        role = msg.get("role", "user").capitalize()
+        content = msg.get("content", "")
+        parts.append(f"{role}: {content}")
+    return "\n\n".join(parts)
+
+
+class _OpenAIProvider:
+    """OpenAI provider supporting both chat.completions and the Responses API.
+
+    The API surface is chosen by ``api_mode``:
+      - "chat":      always use chat.completions (e.g. gpt-5-mini)
+      - "responses": always use the Responses API (e.g. gpt-5.4-mini)
+      - "auto":      try chat.completions, fall back to Responses when the model
+                     isn't supported there (default)
+
+    ``send_temperature`` controls whether the temperature parameter is sent at
+    all — some models reject any explicit temperature, so set it to False for
+    them. As a safety net, a temperature-rejection error also triggers a
+    one-time retry without it, so a misconfigured setting degrades gracefully.
+    """
+
+    def __init__(
+        self,
+        api_key: str | None,
+        base_url: str | None,
+        api_mode: str = "auto",
+        send_temperature: bool = True,
+    ) -> None:
         from openai import AsyncOpenAI
 
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self._api_mode = api_mode
+        self._send_temperature = send_temperature
+        self._use_responses: dict[str, bool] = {}  # model → True once responses is required
 
     async def chat(
         self,
@@ -126,51 +195,102 @@ class _OpenAIProvider:
         messages: list[dict[str, str]],
         model: str,
         temperature: float,
+    ) -> str:
+        temp = temperature if self._send_temperature else None
+
+        if self._api_mode == "responses" or self._use_responses.get(model):
+            return await self._chat_via_responses(system, messages, model, temp)
+
+        try:
+            return await self._chat_via_completions(system, messages, model, temp)
+        except Exception as exc:
+            # In "chat" mode the endpoint is pinned by the user — don't fall back.
+            if self._api_mode != "chat" and _is_unsupported_model_error(exc):
+                logger.info(
+                    "Model '%s' unsupported on /chat/completions, falling back to /responses",
+                    model,
+                )
+                self._use_responses[model] = True
+                return await self._chat_via_responses(system, messages, model, temp)
+            raise
+
+    async def _chat_via_completions(
+        self,
+        system: str,
+        messages: list[dict[str, str]],
+        model: str,
+        temperature: float | None,
     ) -> str:
         api_messages = [{"role": "system", "content": system}, *messages]
-        response = await self._client.chat.completions.create(
-            model=model,
-            temperature=temperature,
-            messages=api_messages,  # type: ignore[arg-type]
-        )
+        try:
+            return await self._do_completions_call(api_messages, model, temperature)
+        except Exception as exc:
+            if temperature is not None and _is_unsupported_temperature_error(exc):
+                logger.debug("Temperature rejected for '%s' on /chat/completions, retrying without", model)
+                return await self._do_completions_call(api_messages, model, None)
+            raise
+
+    async def _do_completions_call(
+        self,
+        api_messages: list[dict[str, str]],
+        model: str,
+        temperature: float | None,
+    ) -> str:
+        kwargs: dict[str, Any] = {"model": model, "messages": api_messages}
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        response = await self._client.chat.completions.create(**kwargs)  # type: ignore[arg-type]
         return response.choices[0].message.content or ""
 
-
-class _AnthropicProvider:
-    """Anthropic Claude provider."""
-
-    def __init__(self, api_key: str | None, base_url: str | None) -> None:
-        from anthropic import AsyncAnthropic
-
-        kwargs: dict[str, Any] = {}
-        if api_key:
-            kwargs["api_key"] = api_key
-        if base_url:
-            kwargs["base_url"] = base_url
-        self._client = AsyncAnthropic(**kwargs)
-
-    async def chat(
+    async def _chat_via_responses(
         self,
         system: str,
         messages: list[dict[str, str]],
         model: str,
-        temperature: float,
+        temperature: float | None,
     ) -> str:
-        response = await self._client.messages.create(
-            model=model,
-            max_tokens=4096,
-            temperature=temperature,
-            system=system,
-            messages=messages,  # type: ignore[arg-type]
-        )
-        return response.content[0].text
+        """Use the OpenAI Responses API for models that don't support chat.completions."""
+        try:
+            return await self._do_responses_call(system, messages, model, temperature)
+        except Exception as exc:
+            if temperature is not None and _is_unsupported_temperature_error(exc):
+                logger.debug("Temperature rejected for '%s' on /responses, retrying without", model)
+                return await self._do_responses_call(system, messages, model, None)
+            raise
+
+    async def _do_responses_call(
+        self,
+        system: str,
+        messages: list[dict[str, str]],
+        model: str,
+        temperature: float | None,
+    ) -> str:
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "instructions": system or None,
+            "input": _build_responses_input("", messages),
+        }
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        response = await self._client.responses.create(**kwargs)
+        # Responses API returns output as a list of content blocks
+        text_parts: list[str] = []
+        for item in response.output:
+            if hasattr(item, "content") and item.content:
+                for block in item.content:
+                    if hasattr(block, "text"):
+                        text_parts.append(block.text)
+        return "\n".join(text_parts)
 
 
 def _build_provider(config: TranslatorConfig) -> _ChatProvider:
-    """Create the appropriate provider based on config."""
-    if config.provider == "anthropic":
-        return _AnthropicProvider(api_key=config.anthropic_api_key, base_url=config.anthropic_base_url)
-    return _OpenAIProvider(api_key=config.api_key, base_url=config.base_url)
+    """Create the OpenAI provider from config."""
+    return _OpenAIProvider(
+        api_key=config.api_key,
+        base_url=config.base_url,
+        api_mode=config.api_mode,
+        send_temperature=config.send_temperature,
+    )
 
 
 # -- Translator --
@@ -189,13 +309,8 @@ class Translator:
         self._glossary = glossary
         self._cache = cache or TranslationCache()
 
-        # Resolve active model/temperature based on provider
-        if self._cfg.provider == "anthropic":
-            self._model = self._cfg.anthropic_model
-            self._temperature = self._cfg.anthropic_temperature
-        else:
-            self._model = self._cfg.model
-            self._temperature = self._cfg.temperature
+        self._model = self._cfg.model
+        self._temperature = self._cfg.temperature
 
         self._system_prompt = _build_system_prompt(
             self._cfg.target_language, glossary
@@ -322,6 +437,9 @@ class Translator:
                 messages.append({"role": "user", "content": _CORRECTION_PROMPT})
                 last_exc = parse_exc
 
+            except ModelNotSupportedError:
+                raise
+
             except Exception as exc:
                 last_exc = exc
                 delay = self._cfg.retry_base_delay * (2 ** (attempt - 1))
@@ -351,6 +469,8 @@ class Translator:
             refined = _parse_response(content, len(items))
             logger.info("Chunk %d: refinement successful", chunk_index)
             return refined
+        except ModelNotSupportedError:
+            raise
         except Exception as exc:
             logger.warning("Chunk %d: refinement failed (%s), using original", chunk_index, exc)
             return items

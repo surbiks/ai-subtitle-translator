@@ -73,7 +73,8 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - Stack: Python 3.11+, async CLI app
 - Entry point: `main.py`
 - Core package: `ai_subtitle_translator/`
-- External deps: `openai`, `anthropic`, `python-dotenv`
+- External deps: `openai`, `python-dotenv`
+- Provider: OpenAI only. API surface is settings-driven via `OPENAI_API_MODE` / `--api-mode` (`auto` | `chat` | `responses`) and `OPENAI_SEND_TEMPERATURE` / `--no-temperature`. `auto` tries chat.completions and falls back to the Responses API; `chat` and `responses` pin the endpoint
 - Supported subtitle formats: `.srt`, `.ass`
 
 ## Current Architecture
@@ -82,7 +83,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - `config.py` owns env-backed dataclasses: `ChunkConfig`, `TranslatorConfig`, `AppConfig`
 - `parser.py` parses SRT and ASS into `SubtitleDocument`; ASS parsing preserves original file lines and dialogue metadata for reconstruction
 - `chunker.py` groups subtitles by time gap, then adaptive line/char limits
-- `translator.py` owns prompt construction, provider abstraction, retries, correction prompts, optional refinement, cache integration, multiline restoration, and metadata preservation across translations
+- `translator.py` owns prompt construction, OpenAI API calls (chat.completions with Responses fallback), retries, correction prompts, optional refinement, cache integration, multiline restoration, and metadata preservation across translations
 - `postprocess.py` applies Persian-specific cleanup after translation
 - `cache.py` persists source-text → translated-text mappings
 - `merger.py` flattens translated chunks and writes the final SRT or ASS file
