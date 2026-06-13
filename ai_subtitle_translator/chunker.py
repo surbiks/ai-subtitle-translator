@@ -123,6 +123,17 @@ def _split_by_size(
         would_exceed_chars = current_chars + sub_chars > max_chars and current
 
         if would_exceed_lines or would_exceed_chars:
+            # Avoid splitting a Q/A turn across chunks: if the previous line
+            # ends with a question mark and this line is the dash-prefixed
+            # response, keep them together (allow 1 line of overrun).
+            if (
+                current
+                and _is_qa_continuation(current[-1], sub)
+                and len(current) <= max_lines
+            ):
+                current.append(sub)
+                current_chars += sub_chars
+                continue
             chunks.append(current)
             current = [sub]
             current_chars = sub_chars
@@ -134,3 +145,14 @@ def _split_by_size(
         chunks.append(current)
 
     return chunks
+
+
+_DASH_STARTS = ("-", "–", "—")
+_QUESTION_ENDS = ("?", "؟")
+
+
+def _is_qa_continuation(prev: Subtitle, curr: Subtitle) -> bool:
+    """True if `prev` ends in a question and `curr` starts a dash-prefixed reply."""
+    prev_text = prev.text.rstrip()
+    curr_text = curr.text.lstrip()
+    return prev_text.endswith(_QUESTION_ENDS) and curr_text.startswith(_DASH_STARTS)

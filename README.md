@@ -77,6 +77,19 @@ cp .env.sample .env
 | `CHUNK_MAX_CHARS` | Max characters per chunk | `1500` |
 | `CHUNK_TIME_GAP_MS` | Time gap to split dialogues (milliseconds) | `2500` |
 | `CHUNK_CONTEXT_LINES` | Lines from previous chunk sent as context | `3` |
+| `ENFORCE_CPS` | Enforce per-line reading-speed budget (compresses overruns) | `true` |
+| `CPS_TARGET` | Target characters-per-second for the translated language | `13.0` |
+| `CPS_MIN_CHARS` | Minimum char budget for very short cues | `20` |
+| `CPS_TOLERANCE` | Multiplier before flagging a line as over budget | `1.2` |
+| `TRANSLATE_CUES` | Translate `[sound]` and `(action)` cues | `true` |
+| `TRANSLATE_LYRICS` | Translate `♪ lyrics ♪` lines | `true` |
+| `ENABLE_MEMORY` | Maintain a rolling story summary across chunks (bypasses cache) | `false` |
+| `MEMORY_UPDATE_INTERVAL` | Update the rolling summary every N chunks | `5` |
+| `AUTO_PROBE` | Run a one-shot register/tone probe before translation | `false` |
+| `REGISTER_OVERRIDE` | Manual film-context description (skips `AUTO_PROBE`) | -- |
+| `AUTO_GLOSSARY` | Auto-discover proper nouns + recurring terms and propose translations | `false` |
+| `AUTO_GLOSSARY_MIN_OCCURRENCES` | Minimum occurrences in source for a term to be a candidate | `3` |
+| `ENFORCE_GLOSSARY` | Re-translate lines that omit a required glossary term | `true` |
 
 ## Usage
 
@@ -160,14 +173,23 @@ CLI flags override `.env` values when provided.
 4. **Translate** -- sends chunks to the OpenAI API in parallel with:
    - Previous context injected in the prompt (not re-translated)
    - Glossary terms injected for consistency
-   - Concise-translation guidance for subtitle readability
+   - Per-line speaker tag (from ASS `Name` field) so register stays consistent per character
+   - Per-line `max_chars` budget derived from on-screen duration × CPS target
+   - Line kind tag (dialog / sound_cue / stage_dir / screen_text / lyrics) with kind-specific instructions
    - Smart retry: on invalid JSON, sends a correction prompt to the model
-   - Optional refinement pass for fluency improvement
+   - CPS retry: if any line exceeds its char budget, sends one compression request for the offenders
+   - Optional **two-step refinement** (`--refine` / `ENABLE_REFINEMENT=true`): the model first critiques each translation, then revises only the items it flagged. Empty critique short-circuits the revise call.
+   - ASS inline-style preservation: `{\i1}`, `{\b1}`, `{\pos(...)}` etc. are stripped before translation and restored onto the translated text (inline tags positioned proportionally, positional tags reattached at line start)
+   - Optional one-shot **register probe** (`AUTO_PROBE=true`) detects genre + tone from a sample and injects it into every system prompt; `REGISTER_OVERRIDE` skips the probe
+   - Optional **rolling story summary** (`ENABLE_MEMORY=true`) keeps character/context continuity across long files — chunks process in batches of `MEMORY_UPDATE_INTERVAL`, summary updates between batches, translation cache is bypassed while active
+   - Optional **auto-glossary** (`AUTO_GLOSSARY=true` or `--auto-glossary`) discovers recurring proper nouns / terms in the source, asks the provider to propose translations, and merges them with any `--glossary` entries (user entries win)
+   - **Glossary compliance** (`ENFORCE_GLOSSARY=true`, default on): after the main translation, any line whose source contains a glossary term but whose translation omits the mapped value triggers one targeted retry
 5. **Post-process** -- Persian-specific normalization:
    - Half-space (nim-fasele) insertion for prefixes/suffixes
    - Latin-to-Persian punctuation conversion
    - Formal-to-conversational phrase simplification
 6. **Multi-line** -- joins multi-line text before translation, restores line structure after
+   - Restore prefers Persian/Latin clause boundaries (`،؛.,;:`) for split points; falls back to even word-count distribution
    - SRT line breaks are preserved as real newlines
    - ASS line breaks are decoded from `\N` / `\n` and restored on write
 7. **Cache** -- caches source→translated pairs; optionally persists between runs

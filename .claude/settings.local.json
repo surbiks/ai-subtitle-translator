@@ -2,7 +2,12 @@
   "permissions": {
     "allow": [
       "Bash(python -c ':*)",
-      "Bash(pip install:*)"
+      "Bash(pip install:*)",
+      "Bash(python -m py_compile main.py ai_subtitle_translator/*.py)",
+      "Bash(python3 -m py_compile main.py ai_subtitle_translator/*.py)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(python3 *)"
     ]
   }
 }

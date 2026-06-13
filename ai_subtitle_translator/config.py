@@ -56,6 +56,23 @@ class TranslatorConfig:
     enable_postprocess: bool = _env_bool("ENABLE_POSTPROCESS", True)
     glossary_path: str | None = _env("GLOSSARY_PATH")
     cache_path: str | None = _env("CACHE_PATH")
+    # Reading-speed (characters-per-second) budget per line
+    cps_target: float = _env_float("CPS_TARGET", 13.0)
+    cps_min_chars: int = _env_int("CPS_MIN_CHARS", 20)
+    enforce_cps: bool = _env_bool("ENFORCE_CPS", True)
+    cps_tolerance: float = _env_float("CPS_TOLERANCE", 1.2)
+    # Line-kind handling
+    translate_cues: bool = _env_bool("TRANSLATE_CUES", True)
+    translate_lyrics: bool = _env_bool("TRANSLATE_LYRICS", True)
+    # Run-level state (Phase 2)
+    enable_memory: bool = _env_bool("ENABLE_MEMORY", False)
+    memory_update_interval: int = _env_int("MEMORY_UPDATE_INTERVAL", 5)
+    auto_probe: bool = _env_bool("AUTO_PROBE", False)
+    register_override: str | None = _env("REGISTER_OVERRIDE")
+    # Glossary lifecycle (Phase 3)
+    auto_glossary: bool = _env_bool("AUTO_GLOSSARY", False)
+    auto_glossary_min_occurrences: int = _env_int("AUTO_GLOSSARY_MIN_OCCURRENCES", 3)
+    enforce_glossary: bool = _env_bool("ENFORCE_GLOSSARY", True)
 
 
 @dataclass
