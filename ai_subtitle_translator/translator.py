@@ -28,38 +28,57 @@ logger = logging.getLogger(__name__)
 # -- Prompt builders --
 
 
+def _is_persian(language: str) -> bool:
+    """True when the target language is Persian/Farsi."""
+    lang = language.lower()
+    return "persian" in lang or "farsi" in lang
+
+
+_PERSIAN_STYLE_BLOCK = """
+
+PERSIAN (FARSI) STYLE
+- Use everyday spoken Iranian Persian (محاوره‌ای), not written/literary forms:
+  می‌خوام، نمی‌دونم، بریم، چی‌کار، آره — not می‌خواهم، نمی‌دانم، برویم.
+- Pick «تو» vs «شما» from the speakers' relationship and stay consistent.
+- Prefer common Persian words over heavy formal Arabic-loan vocabulary.
+- Use Persian punctuation (؟ ، ؛) and «…» for quotes; use the half-space (ZWNJ)
+  correctly: می‌خوام، کتاب‌ها، خونه‌ام.
+- Make it sound like real Persian movie subtitles: short, casual, natural."""
+
+
 def _build_system_prompt(
     language: str,
     glossary: Glossary | None = None,
 ) -> str:
     glossary_section = glossary.build_prompt_section() if glossary and not glossary.is_empty else ""
+    persian_section = _PERSIAN_STYLE_BLOCK if _is_persian(language) else ""
 
-    return f"""You are a professional subtitle translator specializing in {language}.
+    return f"""You are a professional subtitle translator. Translate the subtitles into natural,
+idiomatic, conversational {language} as spoken in real films and TV.
 
-Your task is to translate subtitles into natural, fluent, and simple {language}.
+TRANSLATION QUALITY
+- Translate meaning, not words. Localize idioms, jokes, and slang to their natural
+  {language} equivalent. Never translate literally.
+- Match each line's tone and register (casual, formal, angry, tender) and keep a
+  given speaker's register consistent across the scene.
+- Keep lines short and readable at subtitle speed; prefer phrasing as short as or
+  shorter than the source.
+- Translate faithfully: do not censor, soften, summarize, add, or omit content.
 
-STRICT RULES:
-- Keep translations natural and conversational (like real spoken {language})
-- Avoid literal translation
-- Use simple and clear {language}
-- Preserve the exact number of subtitle items
-- Do NOT merge or split lines
-- Keep alignment with original meaning
-- Do NOT add explanations
-- Output MUST be valid JSON
-- Keep translations concise to fit subtitle reading speed
+KEEP VERBATIM (do not translate or alter)
+- Markup: HTML-like tags such as <i>...</i>, ASS tags like {{\\an8}}, and music notes ♪.
+- Proper nouns, brand names, and numbers — unless the glossary says otherwise.
 
-STYLE:
-- Use modern spoken {language}
-- Avoid formal/literary tone
-- Keep sentences short and natural
-- Make it sound like {language} movie subtitles{glossary_section}
+STRUCTURE (critical)
+- Input is a JSON array of objects with "id" and "text".
+- Return a JSON array with EXACTLY the same number of objects and the SAME "id" values.
+- One input item = one output item. Never merge or split items, even when a sentence
+  spans several items — translate each so it reads correctly in its own position.
+- A "Previous context" block may be supplied for continuity only — never translate
+  or include those lines.
 
-INPUT:
-JSON array of subtitle objects with "id" and "text" fields.
-
-OUTPUT:
-JSON array with the same "id" fields and translated "text" fields. Nothing else."""
+OUTPUT
+- Output ONLY the JSON array. No explanations, no markdown, no code fences.{persian_section}{glossary_section}"""
 
 
 def _build_user_message(
@@ -81,13 +100,15 @@ def _build_user_message(
     return "\n".join(parts)
 
 
-_REFINEMENT_PROMPT = """You are a Persian subtitle editor. Improve this translated subtitle text:
+def _build_refinement_prompt(language: str) -> str:
+    """Second-pass editor prompt, specialized for the target language."""
+    return f"""You are a {language} subtitle editor. Improve this translated subtitle text:
 - Make it more natural and conversational
 - Fix any awkward phrasing
 - Keep it concise for subtitle readability
-- Do NOT change the JSON structure
+- Do NOT change the JSON structure or the "id" values
 
-Input and output: JSON array of {{"id": int, "text": string}}.
+Input and output: a JSON array of objects with "id" (int) and "text" (string).
 Return ONLY the improved JSON array."""
 
 _CORRECTION_PROMPT = (
@@ -315,6 +336,7 @@ class Translator:
         self._system_prompt = _build_system_prompt(
             self._cfg.target_language, glossary
         )
+        self._refinement_prompt = _build_refinement_prompt(self._cfg.target_language)
 
     @property
     def cache(self) -> TranslationCache:
@@ -376,7 +398,7 @@ class Translator:
                 translated_text = trans.get("text", orig.text)
 
                 # Apply Persian post-processing if target is Persian
-                if "persian" in self._cfg.target_language.lower() or "farsi" in self._cfg.target_language.lower():
+                if _is_persian(self._cfg.target_language):
                     translated_text = postprocess_persian(translated_text)
 
                 # Restore multi-line structure if original was multi-line
@@ -461,7 +483,7 @@ class Translator:
             logger.info("Chunk %d: refinement pass", chunk_index)
             payload = json.dumps(items, ensure_ascii=False)
             content = await self._provider.chat(
-                system=_REFINEMENT_PROMPT,
+                system=self._refinement_prompt,
                 messages=[{"role": "user", "content": payload}],
                 model=self._model,
                 temperature=self._temperature,

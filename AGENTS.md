@@ -106,3 +106,4 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - Avoid speculative abstractions; this codebase is intentionally small and linear
 - For ASS files, only `Dialogue:` text is translated; styles, timing, and non-dialogue sections must remain untouched
 - ASS line breaks are normalized to real newlines during translation and restored to `\N`/`\n` when writing
+- The system prompt instructs the model to keep markup (`<i>`, ASS `{\...}` tags, `♪`) verbatim and to preserve one-to-one id mapping; a Persian-specific style block (spoken register, تو/شما, ZWNJ, Persian punctuation) is injected only when the target is Persian/Farsi (`_is_persian`). The refinement prompt is parameterized by target language
