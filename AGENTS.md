@@ -73,20 +73,17 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - Stack: Python 3.11+, async CLI app
 - Entry point: `main.py`
 - Core package: `ai_subtitle_translator/`
-- External deps: `openai`, `anthropic`, `python-dotenv`
+- External deps: `openai`, `python-dotenv`
+- Provider: OpenAI only. API surface is settings-driven via `OPENAI_API_MODE` / `--api-mode` (`auto` | `chat` | `responses`) and `OPENAI_SEND_TEMPERATURE` / `--no-temperature`. `auto` tries chat.completions and falls back to the Responses API; `chat` and `responses` pin the endpoint
 - Supported subtitle formats: `.srt`, `.ass`
 
 ## Current Architecture
 
 - `main.py` orchestrates parse → chunk → context → translate → merge → write
 - `config.py` owns env-backed dataclasses: `ChunkConfig`, `TranslatorConfig`, `AppConfig`
-- `parser.py` parses SRT and ASS into `SubtitleDocument`; ASS parsing preserves original file lines, dialogue metadata, and the `Name` field as `Subtitle.speaker`
-- `classify.py` labels each line as DIALOG / SOUND_CUE / STAGE_DIR / SCREEN_TEXT / LYRICS via regex
-- `chunker.py` groups subtitles by time gap, then adaptive line/char limits; avoids splitting Q/A turns (`?`/`؟` followed by dash-prefixed reply)
-- `translator.py` owns prompt construction, provider abstraction, retries, correction prompts, optional refinement, cache integration, multiline restoration, metadata preservation, per-line reading-speed (CPS) budget enforcement, kind-aware payload routing, the one-shot register probe, and batched-parallel processing when rolling memory is enabled
-- `memory.py` holds the rolling story summary (`StoryMemory`) and its provider-driven update step
-- `discover.py` heuristically extracts proper-noun candidates from source subtitles and asks the provider for translations; `glossary.extend()` merges them in and `glossary.check_compliance()` powers the per-line retry
-- `ass_tags.py` strips ASS override tags (`{\\i1}`, `{\\pos(...)}`, etc.) before translation and restores them onto the translated text — inline tags map proportionally, positional tags reattach at line start
+- `parser.py` parses SRT and ASS into `SubtitleDocument`; ASS parsing preserves original file lines and dialogue metadata for reconstruction
+- `chunker.py` groups subtitles by time gap, then adaptive line/char limits
+- `translator.py` owns prompt construction, OpenAI API calls (chat.completions with Responses fallback), retries, correction prompts, optional refinement, cache integration, multiline restoration, and metadata preservation across translations
 - `postprocess.py` applies Persian-specific cleanup after translation
 - `cache.py` persists source-text → translated-text mappings
 - `merger.py` flattens translated chunks and writes the final SRT or ASS file
@@ -109,3 +106,4 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - Avoid speculative abstractions; this codebase is intentionally small and linear
 - For ASS files, only `Dialogue:` text is translated; styles, timing, and non-dialogue sections must remain untouched
 - ASS line breaks are normalized to real newlines during translation and restored to `\N`/`\n` when writing
+- The system prompt instructs the model to keep markup (`<i>`, ASS `{\...}` tags, `♪`) verbatim and to preserve one-to-one id mapping; a Persian-specific style block (spoken register, تو/شما, ZWNJ, Persian punctuation) is injected only when the target is Persian/Farsi (`_is_persian`). The refinement prompt is parameterized by target language

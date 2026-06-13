@@ -1,5 +1,5 @@
 """
-Async subtitle translator with multi-provider support (OpenAI & Anthropic).
+Async subtitle translator using the OpenAI API.
 
 Features:
 - Context-aware prompting (previous chunk as read-only context)
@@ -33,73 +33,58 @@ logger = logging.getLogger(__name__)
 # -- Prompt builders --
 
 
+def _is_persian(language: str) -> bool:
+    """True when the target language is Persian/Farsi."""
+    lang = language.lower()
+    return "persian" in lang or "farsi" in lang
+
+
+_PERSIAN_STYLE_BLOCK = """
+
+PERSIAN (FARSI) STYLE
+- Use everyday spoken Iranian Persian (محاوره‌ای), not written/literary forms:
+  می‌خوام، نمی‌دونم، بریم، چی‌کار، آره — not می‌خواهم، نمی‌دانم، برویم.
+- Pick «تو» vs «شما» from the speakers' relationship and stay consistent.
+- Prefer common Persian words over heavy formal Arabic-loan vocabulary.
+- Use Persian punctuation (؟ ، ؛) and «…» for quotes; use the half-space (ZWNJ)
+  correctly: می‌خوام، کتاب‌ها، خونه‌ام.
+- Make it sound like real Persian movie subtitles: short, casual, natural."""
+
+
 def _build_system_prompt(
     language: str,
     glossary: Glossary | None = None,
     film_context: str = "",
 ) -> str:
     glossary_section = glossary.build_prompt_section() if glossary and not glossary.is_empty else ""
-    context_section = ""
-    if film_context.strip():
-        context_section = (
-            "\n\nFILM CONTEXT:\n"
-            f"{film_context.strip()}\n"
-            f"Tune register, tone, and word choice to fit this context consistently."
-        )
+    persian_section = _PERSIAN_STYLE_BLOCK if _is_persian(language) else ""
 
-    return f"""You are a professional subtitle translator specializing in {language}.
+    return f"""You are a professional subtitle translator. Translate the subtitles into natural,
+idiomatic, conversational {language} as spoken in real films and TV.
 
-Your task is to translate subtitles into natural, fluent, and simple {language}.
+TRANSLATION QUALITY
+- Translate meaning, not words. Localize idioms, jokes, and slang to their natural
+  {language} equivalent. Never translate literally.
+- Match each line's tone and register (casual, formal, angry, tender) and keep a
+  given speaker's register consistent across the scene.
+- Keep lines short and readable at subtitle speed; prefer phrasing as short as or
+  shorter than the source.
+- Translate faithfully: do not censor, soften, summarize, add, or omit content.
 
-STRICT RULES:
-- Keep translations natural and conversational (like real spoken {language})
-- Avoid literal translation
-- Use simple and clear {language}
-- Preserve the exact number of subtitle items
-- Do NOT merge or split lines
-- Keep alignment with original meaning
-- Do NOT add explanations
-- Output MUST be valid JSON
-- Keep translations concise to fit subtitle reading speed
+KEEP VERBATIM (do not translate or alter)
+- Markup: HTML-like tags such as <i>...</i>, ASS tags like {{\\an8}}, and music notes ♪.
+- Proper nouns, brand names, and numbers — unless the glossary says otherwise.
 
-STYLE:
-- Use modern spoken {language}
-- Avoid formal/literary tone
-- Keep sentences short and natural
-- Make it sound like {language} movie subtitles
+STRUCTURE (critical)
+- Input is a JSON array of objects with "id" and "text".
+- Return a JSON array with EXACTLY the same number of objects and the SAME "id" values.
+- One input item = one output item. Never merge or split items, even when a sentence
+  spans several items — translate each so it reads correctly in its own position.
+- A "Previous context" block may be supplied for continuity only — never translate
+  or include those lines.
 
-SPEAKER CONSISTENCY:
-- Some items include a "speaker" field (character name).
-- Maintain a consistent register (formal vs informal) per speaker across the
-  ENTIRE file. Pick register from relationship cues in the dialog
-  (boss/employee → formal, friends → informal, parent → child → mixed).
-- Never switch register for the same speaker mid-conversation unless the
-  source clearly signals it.
-- Within a single line, a leading dash ("-" / "–" / "—") marks a speaker
-  change between two turns. Translate each turn naturally and keep the dash.
-
-LINE KINDS (the "kind" field, default is dialog when absent):
-- "dialog" — translate naturally as spoken {language}.
-- "sound_cue" — bracketed sounds like [music]. Translate inside brackets,
-  e.g. [music] → [موسیقی]. Keep the brackets.
-- "stage_dir" — parenthetical action like (whispering). Translate inside the
-  parentheses. Keep the parentheses.
-- "screen_text" — on-screen text (signs, titles, captions). Translate
-  naturally without conversational softening.
-- "lyrics" — translate poetically; preserve any ♪ markers.
-
-LENGTH BUDGET:
-- Some items have "max_chars". The translation MUST fit within that budget.
-- Compress aggressively when needed: drop fillers ("you know", "well", "I
-  mean"), contract clauses, use shorter synonyms.
-- Meaning preservation > literal preservation.{glossary_section}{context_section}
-
-INPUT:
-JSON array of subtitle objects with "id" and "text" fields, plus optional
-"speaker", "kind", and "max_chars" fields.
-
-OUTPUT:
-JSON array with the same "id" fields and translated "text" fields. Nothing else."""
+OUTPUT
+- Output ONLY the JSON array. No explanations, no markdown, no code fences.{persian_section}{glossary_section}"""
 
 
 def _build_user_message(
@@ -125,37 +110,16 @@ def _build_user_message(
     return "\n".join(parts)
 
 
-_PROBE_PROMPT = (
-    "Given these subtitle lines from a film, in 2 short lines describe "
-    "(1) genre / setting and (2) register (formal, conversational, period, "
-    "slangy, poetic, technical, etc.). Be concrete and brief — these notes "
-    "tune a downstream translator."
-)
+def _build_refinement_prompt(language: str) -> str:
+    """Second-pass editor prompt, specialized for the target language."""
+    return f"""You are a {language} subtitle editor. Improve this translated subtitle text:
+- Make it more natural and conversational
+- Fix any awkward phrasing
+- Keep it concise for subtitle readability
+- Do NOT change the JSON structure or the "id" values
 
-_CRITIQUE_SYSTEM_PROMPT = (
-    "You are a {language} subtitle editor. Identify SPECIFIC issues only. "
-    "Do not rewrite. Do not praise. Be terse."
-)
-
-_CRITIQUE_USER_PROMPT = (
-    "Find issues in these translations (naturalness, register, length, "
-    "glossary, awkward phrasing). Output a JSON array of "
-    '{{"id": int, "issues": [string]}} for items with problems. '
-    "Empty array if all are fine.\n\n"
-    "{payload}"
-)
-
-_REVISE_SYSTEM_PROMPT = (
-    "You revise {language} subtitles given specific criticism. Apply every "
-    "flagged fix, change nothing else, preserve item ids exactly."
-)
-
-_REVISE_USER_PROMPT = (
-    "Original translations:\n{items}\n\n"
-    "Criticism:\n{critique}\n\n"
-    "Output the revised JSON array of {{\"id\": int, \"text\": string}}, "
-    "same ids, fixing every flagged issue. JSON only."
-)
+Input and output: a JSON array of objects with "id" (int) and "text" (string).
+Return ONLY the improved JSON array."""
 
 _CORRECTION_PROMPT = (
     "Your previous output was not valid JSON. "
@@ -179,48 +143,82 @@ class _ChatProvider(Protocol):
     ) -> str: ...
 
 
+class ModelNotSupportedError(Exception):
+    """Raised when a model doesn't support the chat completions endpoint."""
+
+
+def _is_unsupported_model_error(exc: Exception) -> bool:
+    """Check if an API error indicates the model doesn't support the endpoint."""
+    err = getattr(exc, "body", None) or getattr(exc, "response", None)
+    if isinstance(exc, dict):
+        err = exc
+    if isinstance(err, dict):
+        code = str(err.get("code", ""))
+        message = str(err.get("message", ""))
+    elif isinstance(err, str):
+        code = ""
+        message = err
+    else:
+        code = str(getattr(err, "code", "") or "")
+        message = str(getattr(err, "message", "") or "") + str(exc)
+
+    return "unsupported_api_for_model" in code or "not accessible via" in message
+
+
+def _is_unsupported_temperature_error(exc: Exception) -> bool:
+    """Check if an API error indicates the model rejects an explicit temperature."""
+    msg = str(exc).lower()
+    if "temperature" not in msg:
+        return False
+    return (
+        "unsupported" in msg
+        or "does not support" in msg
+        or "only the default" in msg
+    )
+
+
+def _build_responses_input(
+    system: str, messages: list[dict[str, str]]
+) -> str:
+    """Convert chat messages to a single input string for the Responses API."""
+    parts: list[str] = []
+    if system:
+        parts.append(f"System: {system}")
+    for msg in messages:
+        role = msg.get("role", "user").capitalize()
+        content = msg.get("content", "")
+        parts.append(f"{role}: {content}")
+    return "\n\n".join(parts)
+
+
 class _OpenAIProvider:
-    """OpenAI-compatible provider (works with any OpenAI-compatible endpoint)."""
+    """OpenAI provider supporting both chat.completions and the Responses API.
 
-    def __init__(self, api_key: str | None, base_url: str | None) -> None:
-        from openai import AsyncOpenAI
+    The API surface is chosen by ``api_mode``:
+      - "chat":      always use chat.completions (e.g. gpt-5-mini)
+      - "responses": always use the Responses API (e.g. gpt-5.4-mini)
+      - "auto":      try chat.completions, fall back to Responses when the model
+                     isn't supported there (default)
 
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-
-    async def chat(
-        self,
-        system: str,
-        messages: list[dict[str, str]],
-        model: str,
-        temperature: float,
-    ) -> str:
-        api_messages = [{"role": "system", "content": system}, *messages]
-        response = await self._client.chat.completions.create(
-            model=model,
-            temperature=temperature,
-            messages=api_messages,  # type: ignore[arg-type]
-        )
-        return response.choices[0].message.content or ""
-
-
-class _AnthropicProvider:
-    """Anthropic Claude provider."""
+    ``send_temperature`` controls whether the temperature parameter is sent at
+    all — some models reject any explicit temperature, so set it to False for
+    them. As a safety net, a temperature-rejection error also triggers a
+    one-time retry without it, so a misconfigured setting degrades gracefully.
+    """
 
     def __init__(
         self,
         api_key: str | None,
         base_url: str | None,
-        max_tokens: int = 4096,
+        api_mode: str = "auto",
+        send_temperature: bool = True,
     ) -> None:
-        from anthropic import AsyncAnthropic
+        from openai import AsyncOpenAI
 
-        kwargs: dict[str, Any] = {}
-        if api_key:
-            kwargs["api_key"] = api_key
-        if base_url:
-            kwargs["base_url"] = base_url
-        self._client = AsyncAnthropic(**kwargs)
-        self._max_tokens = max_tokens
+        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self._api_mode = api_mode
+        self._send_temperature = send_temperature
+        self._use_responses: dict[str, bool] = {}  # model → True once responses is required
 
     async def chat(
         self,
@@ -229,25 +227,101 @@ class _AnthropicProvider:
         model: str,
         temperature: float,
     ) -> str:
-        response = await self._client.messages.create(
-            model=model,
-            max_tokens=self._max_tokens,
-            temperature=temperature,
-            system=system,
-            messages=messages,  # type: ignore[arg-type]
-        )
-        return response.content[0].text
+        temp = temperature if self._send_temperature else None
+
+        if self._api_mode == "responses" or self._use_responses.get(model):
+            return await self._chat_via_responses(system, messages, model, temp)
+
+        try:
+            return await self._chat_via_completions(system, messages, model, temp)
+        except Exception as exc:
+            # In "chat" mode the endpoint is pinned by the user — don't fall back.
+            if self._api_mode != "chat" and _is_unsupported_model_error(exc):
+                logger.info(
+                    "Model '%s' unsupported on /chat/completions, falling back to /responses",
+                    model,
+                )
+                self._use_responses[model] = True
+                return await self._chat_via_responses(system, messages, model, temp)
+            raise
+
+    async def _chat_via_completions(
+        self,
+        system: str,
+        messages: list[dict[str, str]],
+        model: str,
+        temperature: float | None,
+    ) -> str:
+        api_messages = [{"role": "system", "content": system}, *messages]
+        try:
+            return await self._do_completions_call(api_messages, model, temperature)
+        except Exception as exc:
+            if temperature is not None and _is_unsupported_temperature_error(exc):
+                logger.debug("Temperature rejected for '%s' on /chat/completions, retrying without", model)
+                return await self._do_completions_call(api_messages, model, None)
+            raise
+
+    async def _do_completions_call(
+        self,
+        api_messages: list[dict[str, str]],
+        model: str,
+        temperature: float | None,
+    ) -> str:
+        kwargs: dict[str, Any] = {"model": model, "messages": api_messages}
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        response = await self._client.chat.completions.create(**kwargs)  # type: ignore[arg-type]
+        return response.choices[0].message.content or ""
+
+    async def _chat_via_responses(
+        self,
+        system: str,
+        messages: list[dict[str, str]],
+        model: str,
+        temperature: float | None,
+    ) -> str:
+        """Use the OpenAI Responses API for models that don't support chat.completions."""
+        try:
+            return await self._do_responses_call(system, messages, model, temperature)
+        except Exception as exc:
+            if temperature is not None and _is_unsupported_temperature_error(exc):
+                logger.debug("Temperature rejected for '%s' on /responses, retrying without", model)
+                return await self._do_responses_call(system, messages, model, None)
+            raise
+
+    async def _do_responses_call(
+        self,
+        system: str,
+        messages: list[dict[str, str]],
+        model: str,
+        temperature: float | None,
+    ) -> str:
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "instructions": system or None,
+            "input": _build_responses_input("", messages),
+        }
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        response = await self._client.responses.create(**kwargs)
+        # Responses API returns output as a list of content blocks
+        text_parts: list[str] = []
+        for item in response.output:
+            if hasattr(item, "content") and item.content:
+                for block in item.content:
+                    if hasattr(block, "text"):
+                        text_parts.append(block.text)
+        return "\n".join(text_parts)
 
 
 def _build_provider(config: TranslatorConfig) -> _ChatProvider:
-    """Create the appropriate provider based on config."""
-    if config.provider == "anthropic":
-        return _AnthropicProvider(
-            api_key=config.anthropic_api_key,
-            base_url=config.anthropic_base_url,
-            max_tokens=config.anthropic_max_tokens,
-        )
-    return _OpenAIProvider(api_key=config.api_key, base_url=config.base_url)
+    """Create the OpenAI provider from config."""
+    return _OpenAIProvider(
+        api_key=config.api_key,
+        base_url=config.base_url,
+        api_mode=config.api_mode,
+        send_temperature=config.send_temperature,
+    )
 
 
 # -- Translator --
@@ -266,13 +340,8 @@ class Translator:
         self._glossary = glossary
         self._cache = cache or TranslationCache()
 
-        # Resolve active model/temperature based on provider
-        if self._cfg.provider == "anthropic":
-            self._model = self._cfg.anthropic_model
-            self._temperature = self._cfg.anthropic_temperature
-        else:
-            self._model = self._cfg.model
-            self._temperature = self._cfg.temperature
+        self._model = self._cfg.model
+        self._temperature = self._cfg.temperature
 
         # Run-level state (Phase 2)
         self._memory: StoryMemory | None = (
@@ -283,6 +352,7 @@ class Translator:
         self._system_prompt = _build_system_prompt(
             self._cfg.target_language, glossary, self._film_context,
         )
+        self._refinement_prompt = _build_refinement_prompt(self._cfg.target_language)
 
     @property
     def cache(self) -> TranslationCache:
@@ -593,9 +663,8 @@ class Translator:
                     result.append(self._copy_with_text(orig, orig.text))
                     continue
 
-                translated_text = by_id.get(orig.id, orig.text)
-
-                if self._cfg.enable_postprocess and self._is_persian_target():
+                # Apply Persian post-processing if target is Persian
+                if _is_persian(self._cfg.target_language):
                     translated_text = postprocess_persian(translated_text)
 
                 if "\n" in orig.text:
@@ -798,6 +867,9 @@ class Translator:
                     messages.append({"role": "user", "content": _CORRECTION_PROMPT})
                 last_exc = parse_exc
 
+            except ModelNotSupportedError:
+                raise
+
             except Exception as exc:
                 last_exc = exc
                 delay = self._cfg.retry_base_delay * (2 ** (attempt - 1))
@@ -824,16 +896,19 @@ class Translator:
         items_json = json.dumps(items, ensure_ascii=False)
 
         try:
-            logger.info("Chunk %d: refinement critique", chunk_index)
-            critique = await self._provider.chat(
-                system=_CRITIQUE_SYSTEM_PROMPT.format(language=lang),
-                messages=[{
-                    "role": "user",
-                    "content": _CRITIQUE_USER_PROMPT.format(payload=items_json),
-                }],
+            logger.info("Chunk %d: refinement pass", chunk_index)
+            payload = json.dumps(items, ensure_ascii=False)
+            content = await self._provider.chat(
+                system=self._refinement_prompt,
+                messages=[{"role": "user", "content": payload}],
                 model=self._model,
                 temperature=0.0,
             )
+            refined = _parse_response(content, len(items))
+            logger.info("Chunk %d: refinement successful", chunk_index)
+            return refined
+        except ModelNotSupportedError:
+            raise
         except Exception as exc:
             logger.warning(
                 "Chunk %d: critique failed (%s) — skipping refinement", chunk_index, exc,
