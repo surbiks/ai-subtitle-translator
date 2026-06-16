@@ -59,11 +59,12 @@ cp .env.sample .env
 
 | Variable | Description | Default |
 |---|---|---|
+| `PROVIDER` | Provider backend: `copilot` or `codex` | `copilot` |
 | `OPENAI_API_KEY` | Your OpenAI API key | -- |
 | `OPENAI_BASE_URL` | API base URL (for proxies or compatible APIs) | `https://api.openai.com/v1` |
 | `OPENAI_MODEL` | Model to use | `gpt-4o-mini` |
 | `OPENAI_TEMPERATURE` | Sampling temperature | `0.3` |
-| `OPENAI_API_MODE` | API surface: `auto`, `chat`, or `responses` | `auto` |
+| `OPENAI_API_MODE` | API surface for `copilot`: `auto`, `chat`, or `responses` (ignored for `codex`) | `auto` |
 | `OPENAI_SEND_TEMPERATURE` | Send the temperature param (set `false` for models that reject it) | `true` |
 | `TARGET_LANGUAGE` | Target translation language | `Persian (Farsi)` |
 | `ENABLE_REFINEMENT` | Enable second-pass quality improvement | `false` |
@@ -90,6 +91,19 @@ cp .env.sample .env
 | `AUTO_GLOSSARY` | Auto-discover proper nouns + recurring terms and propose translations | `false` |
 | `AUTO_GLOSSARY_MIN_OCCURRENCES` | Minimum occurrences in source for a term to be a candidate | `3` |
 | `ENFORCE_GLOSSARY` | Re-translate lines that omit a required glossary term | `true` |
+
+### Providers
+
+Two OpenAI-compatible backends are supported, selected via `PROVIDER` / `--provider`:
+
+- **`copilot`** (default) — uses `chat.completions`, falling back to the non-streaming Responses API per `OPENAI_API_MODE`. Works with the real OpenAI API and most compatible proxies.
+- **`codex`** — uses the **streaming-only** Responses API (`stream:true`, list-shaped input). For proxies that expose models this way. `OPENAI_API_MODE` is ignored; set `OPENAI_SEND_TEMPERATURE=false` for models that reject an explicit temperature.
+
+```bash
+# codex example
+PROVIDER=codex OPENAI_BASE_URL=http://localhost:3001/v1 \
+  python main.py movie.srt -m codex/gpt-5.5
+```
 
 ## Usage
 
@@ -145,6 +159,7 @@ python main.py movie.srt output.srt \
 |---|---|
 | `input` | Path to the input subtitle file (`.srt` or `.ass`) |
 | `output` | (Optional) Output path, defaults to `<input>.fa.<ext>` |
+| `--provider` | Provider backend: `copilot` or `codex` |
 | `-l`, `--language` | Target language |
 | `-m`, `--model` | Model name |
 | `--api-key` | OpenAI API key |

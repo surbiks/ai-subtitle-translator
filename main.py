@@ -110,6 +110,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Translation
     p.add_argument(
+        "--provider", default=None, choices=["copilot", "codex"],
+        help="Provider backend: 'copilot' (chat + non-stream Responses) or "
+             "'codex' (streaming-only Responses API) (default: from .env or 'copilot')",
+    )
+    p.add_argument(
         "-l", "--language", default=None,
         help="Target language (default: from .env or 'Persian (Farsi)')",
     )
@@ -205,6 +210,8 @@ def main() -> None:
         chunk_cfg.context_lines = args.context_lines
 
     translator_cfg = TranslatorConfig()
+    if args.provider is not None:
+        translator_cfg.provider = args.provider
     if args.language is not None:
         translator_cfg.target_language = args.language
     if args.model is not None:

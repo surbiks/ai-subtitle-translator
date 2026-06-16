@@ -16,9 +16,12 @@ import asyncio
 import json
 import logging
 import re
-from typing import Any, Protocol
+import httpx
 
+from typing import Any, Protocol
 from ai_subtitle_translator.ass_tags import has_tags, restore_tags, strip_tags
+from collections.abc import Iterable
+
 from ai_subtitle_translator.cache import TranslationCache
 from ai_subtitle_translator.classify import LineKind, classify
 from ai_subtitle_translator.config import TranslatorConfig
@@ -314,8 +317,120 @@ class _OpenAIProvider:
         return "\n".join(text_parts)
 
 
+def _to_codex_input(messages: list[dict[str, str]]) -> list[dict[str, Any]]:
+    """Convert chat messages to the Responses API list-input shape.
+
+    The system prompt is carried separately via ``instructions``, so it is not
+    included here. Assistant turns (from the correction-retry flow) use
+    ``output_text`` content; everything else uses ``input_text``.
+    """
+    items: list[dict[str, Any]] = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content_type = "output_text" if role == "assistant" else "input_text"
+        items.append(
+            {
+                "role": role,
+                "content": [{"type": content_type, "text": msg.get("content", "")}],
+            }
+        )
+    return items
+
+
+def _extract_codex_text(lines: Iterable[str]) -> str:
+    """Accumulate assistant text from codex SSE ``data:`` lines.
+
+    Concatenates every ``response.output_text.delta`` fragment, falling back to
+    the ``response.output_text.done`` text if no deltas were seen. Raises on
+    error/failed events; unknown events (rate limits, lifecycle) are ignored.
+    """
+    parts: list[str] = []
+    done_text: str | None = None
+
+    for line in lines:
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:"):].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            evt = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+
+        etype = evt.get("type")
+        if etype == "response.output_text.delta":
+            parts.append(evt.get("delta", ""))
+        elif etype == "response.output_text.done":
+            done_text = evt.get("text")
+        elif etype == "response.completed":
+            break
+        elif etype in ("response.failed", "error") or evt.get("error"):
+            raise RuntimeError(f"codex stream error: {data[:300]}")
+
+    return "".join(parts) or (done_text or "")
+
+
+class _CodexProvider:
+    """OpenAI-compatible proxy that speaks only the *streaming* Responses API.
+
+    Requires ``stream=true`` and a list-shaped ``input``, and emits some
+    non-standard SSE events (e.g. ``codex.rate_limits``) which we ignore.
+    Returns the full assistant text once the stream completes, so the rest of
+    the translator (JSON parsing, retry, cache) is unchanged.
+    """
+
+    def __init__(
+        self,
+        api_key: str | None,
+        base_url: str | None,
+        send_temperature: bool = False,
+    ) -> None:
+        self._api_key = api_key or "dummy"
+        self._base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
+        self._send_temperature = send_temperature
+
+    async def chat(
+        self,
+        system: str,
+        messages: list[dict[str, str]],
+        model: str,
+        temperature: float,
+    ) -> str:
+        body: dict[str, Any] = {
+            "model": model,
+            "stream": True,
+            "instructions": system or None,
+            "input": _to_codex_input(messages),
+        }
+        if self._send_temperature and temperature is not None:
+            body["temperature"] = temperature
+
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        url = f"{self._base_url}/responses"
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
+            async with client.stream("POST", url, json=body, headers=headers) as resp:
+                if resp.status_code != 200:
+                    detail = (await resp.aread()).decode("utf-8", "replace")
+                    raise RuntimeError(f"codex HTTP {resp.status_code}: {detail[:300]}")
+                lines = [line async for line in resp.aiter_lines()]
+
+        return _extract_codex_text(lines)
+
+
 def _build_provider(config: TranslatorConfig) -> _ChatProvider:
-    """Create the OpenAI provider from config."""
+    """Create the provider backend selected by ``config.provider``."""
+    if config.provider == "codex":
+        return _CodexProvider(
+            api_key=config.api_key,
+            base_url=config.base_url,
+            send_temperature=config.send_temperature,
+        )
+    # "copilot" — chat.completions with non-streaming Responses fallback
     return _OpenAIProvider(
         api_key=config.api_key,
         base_url=config.base_url,
