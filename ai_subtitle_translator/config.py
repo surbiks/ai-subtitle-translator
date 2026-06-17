@@ -43,6 +43,9 @@ class TranslatorConfig:
     model: str = _env("OPENAI_MODEL", "gpt-4o-mini")  # type: ignore[assignment]
     api_key: str | None = _env("OPENAI_API_KEY")
     base_url: str | None = _env("OPENAI_BASE_URL")
+    # Provider backend: "copilot" (default — chat + non-stream Responses) or
+    # "codex" (streaming-only Responses API via an OpenAI-compatible proxy).
+    provider: str = _env("PROVIDER", "copilot")  # type: ignore[assignment]
     # API surface: "auto" (try chat.completions, fall back to responses),
     # "chat" (force chat.completions), or "responses" (force the Responses API).
     api_mode: str = _env("OPENAI_API_MODE", "auto")  # type: ignore[assignment]
