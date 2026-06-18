@@ -8,3 +8,4 @@ __pycache__
 *.log
 glossary.json
 cache.json
+.translation-status/

@@ -87,10 +87,12 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - `postprocess.py` applies Persian-specific cleanup after translation
 - `cache.py` persists source-text → translated-text mappings
 - `merger.py` flattens translated chunks and writes the final SRT or ASS file
+- `resume.py` owns resume / retry-failed-chunks: source/chunk SHA-256 hashing, the `TranslationStatus`/`ChunkRecord` model, status-file path/load/atomic-save/delete, and `build_final_subtitle_from_status`. `translator.py` exposes `translate_chunks_detailed(targets, progress_callback, retry_mode)` returning `ChunkOutcome` per chunk (with validation via `_validate_translation`); `translate_chunks` stays as a backward-compatible wrapper
 
 ## Change Guide
 
 - Prompt/provider behavior changes usually belong in `ai_subtitle_translator/translator.py`
+- Resume / status-file behavior (hashing, status schema, path naming, rebuild) belongs in `ai_subtitle_translator/resume.py`; the orchestration (find/resume/save-per-chunk/delete/report) lives in `main.translate_file`
 - New CLI/env options usually require matching edits in both `main.py` and `ai_subtitle_translator/config.py`
 - Chunking changes belong in `ai_subtitle_translator/chunker.py`
 - Persian wording or punctuation cleanup changes belong in `ai_subtitle_translator/postprocess.py`
@@ -102,7 +104,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - Keep subtitle count and IDs aligned with source subtitles
 - Multi-line subtitles are translated as single-line text, then split back heuristically
 - Cache keys are raw source subtitle text
-- If a chunk translation fails after retries, the original text is preserved for that chunk
+- If a chunk translation fails after retries, the original text is preserved for that chunk. The failure is also recorded in a `.translation-status/<hash>.<lang>.<fmt>.json` file (matched by normalized source-content hash + language + format + chunking version) so a later run resumes only the failed/pending chunks; the status file is written atomically after each chunk and deleted once every chunk is translated. `chunking_version` (`resume.CHUNKING_VERSION`) must be bumped when chunk boundaries change
 - Avoid speculative abstractions; this codebase is intentionally small and linear
 - For ASS files, only `Dialogue:` text is translated; styles, timing, and non-dialogue sections must remain untouched
 - ASS line breaks are normalized to real newlines during translation and restored to `\N`/`\n` when writing

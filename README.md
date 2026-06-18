@@ -13,6 +13,7 @@ A production-grade async subtitle translation system that translates SRT and ASS
 - **Refinement pass** -- optional second API call to improve fluency and naturalness
 - **Correction retry** -- on invalid JSON, sends a correction prompt instead of blindly retrying
 - **Persistent caching** -- avoids re-translating identical lines; optionally saves cache to disk
+- **Resume / retry failed chunks** -- a per-file status file records failed chunks so re-running on the same file retries only those; it is deleted automatically once everything is translated
 - **Async & parallel** -- concurrent API calls with configurable semaphore limit
 - **Flexible config** -- all settings via `.env`, CLI flags, or both (CLI takes priority)
 - **Custom endpoints** -- works with any OpenAI-compatible API
@@ -34,6 +35,7 @@ A production-grade async subtitle translation system that translates SRT and ASS
     ├── glossary.py                     # Glossary loading and prompt injection
     ├── postprocess.py                  # Persian text normalization pipeline
     ├── cache.py                        # Translation cache with persistence
+    ├── resume.py                       # Resume / retry-failed-chunks status files
     └── merger.py                       # Merge & write SRT/ASS output
 ```
 
@@ -135,6 +137,11 @@ python main.py movie.srt --refine
 # Persistent cache (reuse across runs)
 python main.py movie.srt --cache .translation_cache.json
 
+# Resume: re-run the same file to retry only the chunks that failed last time
+python main.py movie.srt            # auto: resumes if a status file exists
+python main.py movie.srt --mode retry_failed   # only retry failed chunks (status file required)
+python main.py movie.srt --mode fresh          # ignore any status file, translate everything
+
 # Custom API endpoint
 python main.py movie.srt --base-url https://my-proxy.example.com/v1
 
@@ -171,6 +178,8 @@ python main.py movie.srt output.srt \
 | `--no-postprocess` | Disable Persian post-processing |
 | `--concurrency` | Max concurrent API calls |
 | `--cache` | Path to persistent cache JSON file |
+| `--mode` | Resume mode: `auto` (default), `fresh`, or `retry_failed` |
+| `--status-dir` | Directory for status files (default: `.translation-status/` next to the source) |
 | `--max-lines` | Max subtitle lines per chunk |
 | `--max-chars` | Max characters per chunk |
 | `--context-lines` | Context lines from previous chunk |
@@ -209,6 +218,24 @@ CLI flags override `.env` values when provided.
    - ASS line breaks are decoded from `\N` / `\n` and restored on write
 7. **Cache** -- caches source→translated pairs; optionally persists between runs
 8. **Merge** -- deduplicates, reassembles, and writes a valid SRT or ASS file with original timing preserved
+9. **Resume** -- only the chunks that aren't already translated are sent to the API. A status file records each chunk's status, source/translated text, attempts, and last error, and is written atomically after every chunk so progress survives a crash. When all chunks succeed the status file is deleted; if any fail it remains for a later resume. See **Resume & retrying failed chunks** below.
+
+### Resume & retrying failed chunks
+
+When a run leaves one or more failed chunks, the failed chunk keeps its original (source-language) text in the output and the run saves a status file next to the source at `.translation-status/<source-hash>.<lang>.<fmt>.json`. Re-running on the same file:
+
+- Matches the status file by a normalized source-content **SHA-256 hash** (line endings normalized to `\n`, BOM stripped) plus target language, format, and chunking version. If the file content changed, the hash differs and it is treated as a brand-new job.
+- **Resumes** only the failed/pending chunks — already-translated chunks are never sent to the API again.
+- Rebuilds the full output (translated text where available, source text otherwise) so the file is always usable.
+- **Deletes** the status file automatically once every chunk is translated.
+
+Modes (`--mode` / `RESUME_MODE`):
+
+| Mode | Behavior |
+|---|---|
+| `auto` (default) | Resume a matching status file if present, otherwise translate fresh |
+| `fresh` | Ignore (and clear) any status file and translate everything |
+| `retry_failed` | Require an existing status file and retry only failed/pending chunks |
 
 ## Architecture Notes
 
@@ -219,9 +246,10 @@ CLI flags override `.env` values when provided.
 1. `parse_subtitle_file()` converts the input file into `Subtitle` dataclass objects
 2. `chunk_subtitles()` groups subtitles into translation-sized chunks
 3. `build_context_window()` attaches previous-chunk context for continuity
-4. `Translator.translate_chunks()` calls the OpenAI API concurrently
-5. `merge_chunks()` flattens translated chunks back into subtitle order
-6. `write_subtitle_file()` writes the final subtitle file in the original format
+4. `find_existing_translation_status()` (from `resume.py`) looks for a resumable status file; only the unfinished chunks become translation targets
+5. `Translator.translate_chunks_detailed()` calls the OpenAI API concurrently for the target chunks, persisting status after each via a progress callback
+6. `build_final_subtitle_from_status()` rebuilds chunks (translated where available, else source); `merge_chunks()` flattens them back into subtitle order
+7. `write_subtitle_file()` writes the final subtitle file in the original format; the status file is deleted if complete, kept otherwise
 
 ### Module responsibilities
 
@@ -234,6 +262,7 @@ CLI flags override `.env` values when provided.
 - `cache.py`: in-memory translation cache with optional JSON persistence
 - `glossary.py`: glossary loading and prompt injection
 - `merger.py`: dedupe, ordering, and SRT/ASS formatting/writing
+- `resume.py`: source/chunk hashing, the translation-status model, status-file path/load/atomic-save/delete, and final-output rebuild for resume
 
 ### Best places to change behavior
 
@@ -249,7 +278,8 @@ CLI flags override `.env` values when provided.
 - Multi-line subtitles are flattened before translation and rebuilt heuristically afterward
 - Cache keys are raw source subtitle text, so identical source lines reuse the same translation
 - Post-processing currently runs whenever target language contains `persian` or `farsi`
-- If a chunk fails permanently, the original source text is kept for that chunk instead of aborting the whole run
+- If a chunk fails permanently, the original source text is kept for that chunk instead of aborting the whole run, and the failure is recorded in a status file for later resume (removed once everything is translated)
+- A chunk is counted as failed (and recorded for resume) when it errors after retries, comes back empty, changes the subtitle count, or returns text identical to the source across all translatable lines
 - JSON response validation checks item shape and warns on item-count mismatch, but still uses the model output when possible
 - For ASS files, only dialogue text is translated; sections, styles, and non-dialogue event lines are preserved
 

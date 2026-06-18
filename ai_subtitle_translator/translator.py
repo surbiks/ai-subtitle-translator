@@ -18,9 +18,10 @@ import logging
 import re
 import httpx
 
+from dataclasses import dataclass
 from typing import Any, Protocol
 from ai_subtitle_translator.ass_tags import has_tags, restore_tags, strip_tags
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from ai_subtitle_translator.cache import TranslationCache
 from ai_subtitle_translator.classify import LineKind, classify
@@ -94,9 +95,13 @@ def _build_user_message(
     payload: list[dict[str, Any]],
     context: list[Subtitle] | None = None,
     memory_block: str = "",
+    retry_note: str = "",
 ) -> str:
     """Build user message with optional rolling-summary and previous-chunk context."""
     parts: list[str] = []
+
+    if retry_note:
+        parts.append(retry_note)
 
     if memory_block:
         parts.append(memory_block)
@@ -128,6 +133,14 @@ _CORRECTION_PROMPT = (
     "Your previous output was not valid JSON. "
     "Return ONLY a valid JSON array of objects with \"id\" (int) and \"text\" (string) fields. "
     "No markdown, no explanation, just the JSON array."
+)
+
+# Prepended to the user message when retrying chunks that failed a prior run,
+# so the model knows it must produce a real translation (not echo the source).
+_RETRY_NOTE = (
+    "These lines failed a previous translation attempt. Translate every item "
+    "fully into the target language now. Never return the original source text "
+    "as the translation.\n"
 )
 
 
@@ -442,6 +455,21 @@ def _build_provider(config: TranslatorConfig) -> _ChatProvider:
 # -- Translator --
 
 
+@dataclass
+class ChunkOutcome:
+    """Result of translating a single chunk.
+
+    ``subtitles`` always holds the best text to use: the translation on success,
+    or the original chunk on failure (so the final file is always complete).
+    ``ok`` reports whether the translation actually succeeded and validated.
+    """
+
+    index: int
+    ok: bool
+    subtitles: list[Subtitle]
+    error: str | None = None
+
+
 class Translator:
     def __init__(
         self,
@@ -464,6 +492,12 @@ class Translator:
         )
         self._film_context: str = (self._cfg.register_override or "").strip()
 
+        # Resume support: set when retrying chunks that failed a prior run, and
+        # a guard so one-time run setup (glossary discovery / register probe)
+        # runs at most once even if multiple entry points are called.
+        self._retry_mode = False
+        self._prepared = False
+
         self._system_prompt = _build_system_prompt(
             self._cfg.target_language, glossary, self._film_context,
         )
@@ -478,10 +512,54 @@ class Translator:
         chunks: list[list[Subtitle]],
         contexts: list[list[Subtitle] | None] | None = None,
     ) -> list[list[Subtitle]]:
-        """Translate all chunks, optionally with a one-shot register probe and
-        a rolling story summary updated every N chunks."""
+        """Translate all chunks, falling back to the original text for any chunk
+        that fails. Kept for backward compatibility; use translate_chunks_detailed
+        for per-chunk success reporting and resume support."""
+        outcomes = await self.translate_chunks_detailed(chunks, contexts)
+        by_index = {o.index: o for o in outcomes}
+        return [by_index[i].subtitles for i in range(len(chunks))]
+
+    async def translate_chunks_detailed(
+        self,
+        chunks: list[list[Subtitle]],
+        contexts: list[list[Subtitle] | None] | None = None,
+        targets: Iterable[int] | None = None,
+        progress_callback: Callable[[ChunkOutcome], None] | None = None,
+        retry_mode: bool = False,
+    ) -> list[ChunkOutcome]:
+        """Translate chunks and report per-chunk outcomes.
+
+        ``targets`` restricts work to specific chunk indices (resume retries only
+        failed/pending chunks); None means all chunks. ``retry_mode`` tells the
+        model these chunks failed before. When given, ``progress_callback`` runs
+        synchronously as each chunk finishes so the caller can persist progress
+        for crash safety. Returns one ChunkOutcome per translated index."""
         if contexts is None:
             contexts = [None] * len(chunks)
+
+        self._retry_mode = retry_mode
+        await self._prepare_run(chunks)
+
+        if targets is None:
+            target_indices = list(range(len(chunks)))
+        else:
+            target_indices = sorted(i for i in set(targets) if 0 <= i < len(chunks))
+
+        # Rolling-memory batching only applies to a full, in-order run.
+        if self._memory is not None and targets is None:
+            return await self._translate_in_batches(chunks, contexts, progress_callback)
+
+        tasks = [
+            self._run_chunk(i, chunks[i], contexts[i], progress_callback=progress_callback)
+            for i in target_indices
+        ]
+        return list(await asyncio.gather(*tasks))
+
+    async def _prepare_run(self, chunks: list[list[Subtitle]]) -> None:
+        """One-time per-run setup: auto-glossary discovery and register probe."""
+        if self._prepared:
+            return
+        self._prepared = True
 
         # Auto-discover glossary terms from the source (Phase 3.1).
         if self._cfg.auto_glossary:
@@ -499,59 +577,69 @@ class Translator:
                 )
                 logger.info("Detected film register: %s", probed.replace("\n", " | "))
 
-        if self._memory is not None:
-            return await self._translate_in_batches(chunks, contexts)
-
-        # Full-parallel path (memory disabled).
-        tasks = [
-            self._translate_chunk(i, chunk, contexts[i])
-            for i, chunk in enumerate(chunks)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        translated: list[list[Subtitle]] = []
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error("Chunk %d failed permanently: %s", i, result)
-                translated.append(chunks[i])  # fallback: original text
-            else:
-                translated.append(result)
-
-        return translated
-
     async def _translate_in_batches(
         self,
         chunks: list[list[Subtitle]],
         contexts: list[list[Subtitle] | None],
-    ) -> list[list[Subtitle]]:
+        progress_callback: Callable[[ChunkOutcome], None] | None = None,
+    ) -> list[ChunkOutcome]:
         """Batched-parallel: translate N chunks sharing the current summary,
         then fold that batch's source text into the summary before the next."""
         assert self._memory is not None
         batch_size = max(1, self._cfg.memory_update_interval)
-        translated: list[list[Subtitle]] = []
+        outcomes: list[ChunkOutcome] = []
 
         for start in range(0, len(chunks), batch_size):
             end = min(start + batch_size, len(chunks))
             memory_block = self._memory.context_block()
             tasks = [
-                self._translate_chunk(i, chunks[i], contexts[i], memory_block=memory_block)
+                self._run_chunk(
+                    i, chunks[i], contexts[i],
+                    memory_block=memory_block,
+                    progress_callback=progress_callback,
+                )
                 for i in range(start, end)
             ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for offset, result in enumerate(results):
-                idx = start + offset
-                if isinstance(result, Exception):
-                    logger.error("Chunk %d failed permanently: %s", idx, result)
-                    translated.append(chunks[idx])
-                else:
-                    translated.append(result)
+            outcomes.extend(await asyncio.gather(*tasks))
 
             batch_subs = [s for i in range(start, end) for s in chunks[i]]
             await self._memory.update(
                 self._provider, self._model, batch_subs, temperature=0.0,
             )
 
-        return translated
+        return outcomes
+
+    async def _run_chunk(
+        self,
+        index: int,
+        chunk: list[Subtitle],
+        context: list[Subtitle] | None,
+        memory_block: str = "",
+        progress_callback: Callable[[ChunkOutcome], None] | None = None,
+    ) -> ChunkOutcome:
+        """Translate one chunk into a ChunkOutcome, catching failures and
+        validating the result. Never raises."""
+        try:
+            translated = await self._translate_chunk(
+                index, chunk, context, memory_block=memory_block
+            )
+            error = _validate_translation(chunk, translated, self._should_translate)
+            if error is None:
+                outcome = ChunkOutcome(index=index, ok=True, subtitles=translated)
+            else:
+                logger.warning("Chunk %d failed validation: %s", index, error)
+                outcome = ChunkOutcome(
+                    index=index, ok=False, subtitles=list(chunk), error=error,
+                )
+        except Exception as exc:
+            logger.error("Chunk %d failed permanently: %s", index, exc)
+            outcome = ChunkOutcome(
+                index=index, ok=False, subtitles=list(chunk), error=str(exc),
+            )
+
+        if progress_callback is not None:
+            progress_callback(outcome)
+        return outcome
 
     async def _discover_glossary(self, chunks: list[list[Subtitle]]) -> None:
         """Extract candidate terms from source text, ask the provider for
@@ -736,7 +824,10 @@ class Translator:
                 chunk, kinds, translate_mask,
                 text_overrides=text_overrides or None,
             )
-            user_msg = _build_user_message(payload, context, memory_block=memory_block)
+            retry_note = _RETRY_NOTE if self._retry_mode else ""
+            user_msg = _build_user_message(
+                payload, context, memory_block=memory_block, retry_note=retry_note,
+            )
             translated_items = await self._call_with_retry_and_correction(
                 index, user_msg, len(payload)
             )
@@ -775,6 +866,12 @@ class Translator:
             for orig, will_translate in zip(chunk, translate_mask):
                 if not will_translate:
                     # Cue/lyric the user opted out of translating — preserve source.
+                    result.append(self._copy_with_text(orig, orig.text))
+                    continue
+
+                translated_text = by_id.get(orig.id)
+                if translated_text is None:
+                    # The model dropped this item — keep the source text.
                     result.append(self._copy_with_text(orig, orig.text))
                     continue
 
@@ -1078,6 +1175,62 @@ class Translator:
 
 
 # -- Helpers --
+
+
+# Runs of 2+ letters (any script). Used to distinguish prose that should be
+# translated from names/interjections/symbols that legitimately stay verbatim.
+_LETTER_RUN_RE = re.compile(r"[^\W\d_]{2,}", re.UNICODE)
+
+
+def _looks_translatable(text: str) -> bool:
+    """Heuristic: does this line contain prose a translator would actually change?
+
+    Returns False for content that legitimately stays identical across languages —
+    symbols, numbers, music markers, and single proper-noun / interjection tokens
+    such as "Carla!" or "Okay." — so an all-names chunk isn't mistaken for an
+    untranslated one (see requirement 15's non-translatable-content exception).
+    """
+    words = _LETTER_RUN_RE.findall(text)
+    if not words:
+        return False  # only symbols / digits / music notes
+    if len(words) == 1 and words[0][:1].isupper():
+        return False  # a single capitalized token — likely a name or interjection
+    return True
+
+
+def _validate_translation(
+    original: list[Subtitle],
+    translated: list[Subtitle],
+    should_translate: Callable[[LineKind], bool],
+) -> str | None:
+    """Validate a translated chunk; return an error string, or None if OK.
+
+    Treats as failures: empty output, a changed subtitle count, or a chunk where
+    nothing was translated yet at least one line is real prose that came back
+    identical to the source (the model echoed the source instead of translating).
+    Lines the user opted out of translating (cues/lyrics) and non-translatable
+    content (names, symbols, music markers) are excluded, so a chunk of only
+    names like "Carla!" legitimately passes.
+    """
+    if not translated:
+        return "empty translation"
+    if len(translated) != len(original):
+        return f"subtitle count changed ({len(original)} -> {len(translated)})"
+
+    translatable = [
+        (o, t)
+        for o, t in zip(original, translated)
+        if should_translate(classify(o.text))
+    ]
+    any_changed = any(t.text.strip() != o.text.strip() for o, t in translatable)
+    unchanged_prose = [
+        o
+        for o, t in translatable
+        if t.text.strip() == o.text.strip() and _looks_translatable(o.text)
+    ]
+    if unchanged_prose and not any_changed:
+        return "translation identical to source"
+    return None
 
 
 def _critique_is_empty(raw: str) -> bool:

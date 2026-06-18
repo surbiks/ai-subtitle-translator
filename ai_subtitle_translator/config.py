@@ -76,6 +76,14 @@ class TranslatorConfig:
     auto_glossary: bool = _env_bool("AUTO_GLOSSARY", False)
     auto_glossary_min_occurrences: int = _env_int("AUTO_GLOSSARY_MIN_OCCURRENCES", 3)
     enforce_glossary: bool = _env_bool("ENFORCE_GLOSSARY", True)
+    # Resume / retry-failed-chunks
+    #   auto         = resume a matching status file if present, else fresh
+    #   fresh        = ignore any status file and translate everything
+    #   retry_failed = require a status file and retry only failed chunks
+    resume_mode: str = _env("RESUME_MODE", "auto")  # type: ignore[assignment]
+    # Directory for per-file translation status files (default: a
+    # ".translation-status" folder next to each source file).
+    status_dir: str | None = _env("STATUS_DIR")
 
 
 @dataclass
