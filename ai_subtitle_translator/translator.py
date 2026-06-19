@@ -436,7 +436,15 @@ class _CodexProvider:
 
 
 def _build_provider(config: TranslatorConfig) -> _ChatProvider:
-    """Create the provider backend selected by ``config.provider``."""
+    """Create the provider backend selected by ``config.provider``.
+
+    When a providers file is configured, route across multiple backends instead
+    of a single one. Imported lazily to avoid an import cycle.
+    """
+    if config.providers_path:
+        from ai_subtitle_translator.providers import RoutingProvider, load_providers_file
+
+        return RoutingProvider(load_providers_file(config.providers_path))
     if config.provider == "codex":
         return _CodexProvider(
             api_key=config.api_key,
@@ -547,13 +555,28 @@ class Translator:
 
         # Rolling-memory batching only applies to a full, in-order run.
         if self._memory is not None and targets is None:
-            return await self._translate_in_batches(chunks, contexts, progress_callback)
+            outcomes = await self._translate_in_batches(chunks, contexts, progress_callback)
+        else:
+            tasks = [
+                self._run_chunk(i, chunks[i], contexts[i], progress_callback=progress_callback)
+                for i in target_indices
+            ]
+            outcomes = list(await asyncio.gather(*tasks))
 
-        tasks = [
-            self._run_chunk(i, chunks[i], contexts[i], progress_callback=progress_callback)
-            for i in target_indices
-        ]
-        return list(await asyncio.gather(*tasks))
+        self._log_provider_usage()
+        return outcomes
+
+    def _log_provider_usage(self) -> None:
+        """Log per-provider request counts when routing across multiple backends."""
+        report = getattr(self._provider, "usage_report", None)
+        if not callable(report):
+            return
+        counts = report()
+        if counts:
+            logger.info(
+                "Provider usage: %s",
+                ", ".join(f"{name}={n}" for name, n in counts.items()),
+            )
 
     async def _prepare_run(self, chunks: list[list[Subtitle]]) -> None:
         """One-time per-run setup: auto-glossary discovery and register probe."""

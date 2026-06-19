@@ -286,6 +286,11 @@ def build_parser() -> argparse.ArgumentParser:
              "'codex' (streaming-only Responses API) (default: from .env or 'copilot')",
     )
     p.add_argument(
+        "--providers", default=None,
+        help="Path to a JSON providers file to route across multiple backends "
+             "(rate-limit/quota aware). Overrides --provider/-m when set.",
+    )
+    p.add_argument(
         "-l", "--language", default=None,
         help="Target language (default: from .env or 'Persian (Farsi)')",
     )
@@ -397,6 +402,8 @@ def main() -> None:
     translator_cfg = TranslatorConfig()
     if args.provider is not None:
         translator_cfg.provider = args.provider
+    if args.providers is not None:
+        translator_cfg.providers_path = args.providers
     if args.language is not None:
         translator_cfg.target_language = args.language
     if args.model is not None:

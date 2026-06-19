@@ -88,11 +88,13 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - `cache.py` persists source-text → translated-text mappings
 - `merger.py` flattens translated chunks and writes the final SRT or ASS file
 - `resume.py` owns resume / retry-failed-chunks: source/chunk SHA-256 hashing, the `TranslationStatus`/`ChunkRecord` model, status-file path/load/atomic-save/delete, and `build_final_subtitle_from_status`. `translator.py` exposes `translate_chunks_detailed(targets, progress_callback, retry_mode)` returning `ChunkOutcome` per chunk (with validation via `_validate_translation`); `translate_chunks` stays as a backward-compatible wrapper
+- `providers.py` owns multi-provider routing. `RoutingProvider` implements the same `_ChatProvider.chat(...)` interface as the single backends, so it's a drop-in: `_build_provider` returns it when `TranslatorConfig.providers_path` is set, else the single provider unchanged. It loads/validates a JSON providers file, keeps per-provider in-memory limit state (RPM window, daily count, cooldown, per-provider semaphore), classifies rate-limit/quota errors across both backend shapes (`_is_rate_limit_error`), and routes `failover` or `round_robin`. It ignores the passed `model` (uses each backend's own `spec.model`) and forwards `temperature` (each backend's `send_temperature` gates the wire)
 
 ## Change Guide
 
 - Prompt/provider behavior changes usually belong in `ai_subtitle_translator/translator.py`
 - Resume / status-file behavior (hashing, status schema, path naming, rebuild) belongs in `ai_subtitle_translator/resume.py`; the orchestration (find/resume/save-per-chunk/delete/report) lives in `main.translate_file`
+- Multi-provider routing (providers-file schema, selection strategy, rate-limit detection, cooldown/cap state) belongs in `ai_subtitle_translator/providers.py`; new backend *types* still go in `translator.py` and must be wired into `providers._build_backend`
 - New CLI/env options usually require matching edits in both `main.py` and `ai_subtitle_translator/config.py`
 - Chunking changes belong in `ai_subtitle_translator/chunker.py`
 - Persian wording or punctuation cleanup changes belong in `ai_subtitle_translator/postprocess.py`

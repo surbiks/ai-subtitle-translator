@@ -46,6 +46,10 @@ class TranslatorConfig:
     # Provider backend: "copilot" (default — chat + non-stream Responses) or
     # "codex" (streaming-only Responses API via an OpenAI-compatible proxy).
     provider: str = _env("PROVIDER", "copilot")  # type: ignore[assignment]
+    # Path to a JSON providers file. When set, requests are routed across the
+    # listed providers (rate-limit/quota aware) instead of the single provider
+    # above; the single-provider settings act as the fallback when unset.
+    providers_path: str | None = _env("PROVIDERS_PATH")
     # API surface: "auto" (try chat.completions, fall back to responses),
     # "chat" (force chat.completions), or "responses" (force the Responses API).
     api_mode: str = _env("OPENAI_API_MODE", "auto")  # type: ignore[assignment]

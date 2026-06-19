@@ -14,6 +14,7 @@ A production-grade async subtitle translation system that translates SRT and ASS
 - **Correction retry** -- on invalid JSON, sends a correction prompt instead of blindly retrying
 - **Persistent caching** -- avoids re-translating identical lines; optionally saves cache to disk
 - **Resume / retry failed chunks** -- a per-file status file records failed chunks so re-running on the same file retries only those; it is deleted automatically once everything is translated
+- **Multi-provider routing** -- define several providers/accounts in a JSON file and route across them (failover or round-robin), switching on rate-limit/quota errors or your own per-minute/per-day caps
 - **Async & parallel** -- concurrent API calls with configurable semaphore limit
 - **Flexible config** -- all settings via `.env`, CLI flags, or both (CLI takes priority)
 - **Custom endpoints** -- works with any OpenAI-compatible API
@@ -25,6 +26,7 @@ A production-grade async subtitle translation system that translates SRT and ASS
 ├── main.py                             # CLI entry point
 ├── .env.sample                         # Environment config template
 ├── glossary.sample.json                # Example glossary file
+├── providers.sample.json               # Example multi-provider routing file
 ├── requirements.txt
 └── ai_subtitle_translator/
     ├── __init__.py
@@ -36,6 +38,7 @@ A production-grade async subtitle translation system that translates SRT and ASS
     ├── postprocess.py                  # Persian text normalization pipeline
     ├── cache.py                        # Translation cache with persistence
     ├── resume.py                       # Resume / retry-failed-chunks status files
+    ├── providers.py                    # Multi-provider routing (rate-limit/quota aware)
     └── merger.py                       # Merge & write SRT/ASS output
 ```
 
@@ -142,6 +145,9 @@ python main.py movie.srt            # auto: resumes if a status file exists
 python main.py movie.srt --mode retry_failed   # only retry failed chunks (status file required)
 python main.py movie.srt --mode fresh          # ignore any status file, translate everything
 
+# Multiple providers / accounts (see "Multiple providers" below)
+python main.py movie.srt --providers providers.json
+
 # Custom API endpoint
 python main.py movie.srt --base-url https://my-proxy.example.com/v1
 
@@ -167,6 +173,7 @@ python main.py movie.srt output.srt \
 | `input` | Path to the input subtitle file (`.srt` or `.ass`) |
 | `output` | (Optional) Output path, defaults to `<input>.fa.<ext>` |
 | `--provider` | Provider backend: `copilot` or `codex` |
+| `--providers` | Path to a JSON providers file for multi-provider routing (overrides `--provider`/`-m`) |
 | `-l`, `--language` | Target language |
 | `-m`, `--model` | Model name |
 | `--api-key` | OpenAI API key |
@@ -237,6 +244,30 @@ Modes (`--mode` / `RESUME_MODE`):
 | `fresh` | Ignore (and clear) any status file and translate everything |
 | `retry_failed` | Require an existing status file and retry only failed/pending chunks |
 
+### Multiple providers
+
+If your accounts have rate limits or daily caps, list several providers in a JSON file and pass `--providers providers.json` (or set `PROVIDERS_PATH`). This **overrides** the single `--provider`/`-m`/`OPENAI_*` settings. Each request picks a provider and switches to the next when the current one returns a rate-limit/quota error **or** reaches a cap you configured. Usage is tracked in memory for the run and reset on the next run (matching daily-quota rollover). Copy `providers.sample.json` to start.
+
+```json
+{
+  "strategy": "failover",
+  "providers": [
+    { "name": "codex-acct1", "provider": "codex", "model": "m1",
+      "base_url": "http://localhost:3001/v1", "api_key": "sk-acct1",
+      "send_temperature": false,
+      "limits": { "requests_per_minute": 60, "requests_per_day": 1000, "concurrency": 3, "cooldown_seconds": 60 } },
+    { "name": "copilot-acct2", "provider": "copilot", "model": "m2", "api_mode": "chat",
+      "api_key": "sk-acct2",
+      "limits": { "requests_per_minute": 30, "requests_per_day": 500, "concurrency": 2, "cooldown_seconds": 120 } }
+  ]
+}
+```
+
+- **`strategy`** — `failover` (use provider #1 until it's limited, then #2, …) or `round_robin` (rotate to spread load and maximize combined throughput).
+- **Per-provider fields** — `name` (unique), `provider` (`copilot`|`codex`), `model` (required), `api_key`/`base_url` (fall back to `OPENAI_API_KEY`/`OPENAI_BASE_URL`), `api_mode` (copilot only), `send_temperature` (defaults: copilot `true`, codex `false`).
+- **`limits`** — `requests_per_minute` / `requests_per_day` (`0` = unlimited), `concurrency` (per-provider in-flight cap), `cooldown_seconds` (how long to sideline a provider after a rate-limit error; a `Retry-After` header is honored when present).
+- **Throughput note** — with `round_robin`, set `MAX_CONCURRENCY` ≥ the sum of the providers' `concurrency` values, otherwise the global concurrency cap throttles you below both accounts' combined capacity.
+
 ## Architecture Notes
 
 ### End-to-end flow
@@ -263,6 +294,7 @@ Modes (`--mode` / `RESUME_MODE`):
 - `glossary.py`: glossary loading and prompt injection
 - `merger.py`: dedupe, ordering, and SRT/ASS formatting/writing
 - `resume.py`: source/chunk hashing, the translation-status model, status-file path/load/atomic-save/delete, and final-output rebuild for resume
+- `providers.py`: multi-provider routing — providers-file loader/validator, per-provider in-memory limit/cooldown state, rate-limit error classification, and the `RoutingProvider` that fails over / round-robins across backends
 
 ### Best places to change behavior
 

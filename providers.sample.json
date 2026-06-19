@@ -1,0 +1,33 @@
+{
+  "strategy": "failover",
+  "providers": [
+    {
+      "name": "codex-acct1",
+      "provider": "codex",
+      "model": "codex/gpt-5.5",
+      "base_url": "http://localhost:3001/v1",
+      "api_key": "sk-acct1-key",
+      "send_temperature": false,
+      "limits": {
+        "requests_per_minute": 60,
+        "requests_per_day": 1000,
+        "concurrency": 3,
+        "cooldown_seconds": 60
+      }
+    },
+    {
+      "name": "copilot-acct2",
+      "provider": "copilot",
+      "model": "gpt-4o",
+      "api_mode": "chat",
+      "api_key": "sk-acct2-key",
+      "send_temperature": true,
+      "limits": {
+        "requests_per_minute": 30,
+        "requests_per_day": 500,
+        "concurrency": 2,
+        "cooldown_seconds": 120
+      }
+    }
+  ]
+}
