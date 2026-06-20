@@ -24,22 +24,29 @@ A production-grade async subtitle translation system that translates SRT and ASS
 ```
 .
 ├── main.py                             # CLI entry point
+├── web.py                              # Web UI launcher (uvicorn)
 ├── .env.sample                         # Environment config template
 ├── glossary.sample.json                # Example glossary file
 ├── providers.sample.json               # Example multi-provider routing file
 ├── requirements.txt
-└── ai_subtitle_translator/
-    ├── __init__.py
-    ├── config.py                       # Dataclass configs, loads from .env
-    ├── parser.py                       # SRT/ASS parsing and subtitle document model
-    ├── chunker.py                      # Adaptive hybrid chunking + context windows
-    ├── translator.py                   # Async OpenAI translation with retry
-    ├── glossary.py                     # Glossary loading and prompt injection
-    ├── postprocess.py                  # Persian text normalization pipeline
-    ├── cache.py                        # Translation cache with persistence
-    ├── resume.py                       # Resume / retry-failed-chunks status files
-    ├── providers.py                    # Multi-provider routing (rate-limit/quota aware)
-    └── merger.py                       # Merge & write SRT/ASS output
+├── ai_subtitle_translator/
+│   ├── __init__.py
+│   ├── config.py                       # Dataclass configs, loads from .env
+│   ├── parser.py                       # SRT/ASS parsing and subtitle document model
+│   ├── chunker.py                      # Adaptive hybrid chunking + context windows
+│   ├── translator.py                   # Async OpenAI translation with retry
+│   ├── glossary.py                     # Glossary loading and prompt injection
+│   ├── postprocess.py                  # Persian text normalization pipeline
+│   ├── cache.py                        # Translation cache with persistence
+│   ├── resume.py                       # Resume / retry-failed-chunks status files
+│   ├── providers.py                    # Multi-provider routing (rate-limit/quota aware)
+│   └── merger.py                       # Merge & write SRT/ASS output
+└── webapp/                             # Web UI (FastAPI + SSE, reuses the pipeline)
+    ├── server.py                       # Routes: page, translate, SSE, download
+    ├── jobs.py                         # In-memory job registry + orchestration
+    ├── models.py                       # API response models
+    ├── templates/index.html            # Upload page (server-rendered)
+    └── static/                         # app.js (fetch + EventSource), style.css
 ```
 
 ## Requirements
@@ -192,6 +199,41 @@ python main.py movie.srt output.srt \
 | `--context-lines` | Context lines from previous chunk |
 
 CLI flags override `.env` values when provided.
+
+## Web UI
+
+A browser front-end is included for translating files without the terminal. It
+reuses the same translation pipeline and streams live per-chunk progress over
+Server-Sent Events.
+
+```bash
+pip install -r requirements.txt   # includes the optional web deps
+python web.py                     # serve on http://127.0.0.1:8000
+python web.py --port 9000         # custom port
+python web.py --host 0.0.0.0      # bind all interfaces (also via $HOST/$PORT)
+python web.py --reload            # auto-reload on code changes (development)
+```
+
+Open the page, upload a `.srt` or `.ass` file, choose the target language,
+model, and provider (the form is pre-filled from your `.env`), then click
+**Translate**. A progress bar advances as chunks complete; when finished, a
+download button serves the translated `*.fa.*` file. API keys default to your
+`.env` but can be overridden per-run in the "Advanced" panel.
+
+Endpoints (all under the same app):
+
+| Route | Purpose |
+|---|---|
+| `GET /` | Upload page |
+| `POST /api/translate` | Start a job (multipart: file + options) → `{job_id}` |
+| `GET /api/jobs/{id}/events` | SSE stream of live progress |
+| `GET /api/jobs/{id}` | JSON status snapshot |
+| `GET /api/jobs/{id}/download` | Translated subtitle file |
+
+Job state is kept in memory for the lifetime of the process, which suits a local
+single-user tool. The MVP exposes the core flow (upload → translate → download);
+advanced CLI features (glossary editor, multi-provider routing, resume UI,
+chunking/CPS knobs) use sensible defaults and are easy follow-ups.
 
 ## How It Works
 

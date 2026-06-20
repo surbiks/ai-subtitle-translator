@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Subtitle Translator</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main class="card">
+    <h1>AI Subtitle Translator</h1>
+    <p class="subtitle">Upload an <code>.srt</code> or <code>.ass</code> file, pick your options, and translate.</p>
+
+    <form id="translate-form">
+      <label class="field">
+        <span>Subtitle file</span>
+        <input type="file" name="file" id="file" accept=".srt,.ass" required />
+      </label>
+
+      <div class="row">
+        <label class="field">
+          <span>Target language</span>
+          <input type="text" name="target_language" value="{{ default_language }}" required />
+        </label>
+        <label class="field">
+          <span>Model</span>
+          <input type="text" name="model" value="{{ default_model }}" required />
+        </label>
+      </div>
+
+      <label class="field">
+        <span>Provider</span>
+        <select name="provider">
+          <option value="copilot" {% if default_provider == 'copilot' %}selected{% endif %}>copilot (chat + Responses)</option>
+          <option value="codex" {% if default_provider == 'codex' %}selected{% endif %}>codex (streaming Responses)</option>
+        </select>
+      </label>
+
+      <details class="advanced">
+        <summary>Advanced (optional)</summary>
+        <p class="hint">Leave blank to use the values from your <code>.env</code>.</p>
+        <label class="field">
+          <span>API key</span>
+          <input type="password" name="api_key" autocomplete="off" placeholder="overrides OPENAI_API_KEY" />
+        </label>
+        <label class="field">
+          <span>Base URL</span>
+          <input type="text" name="base_url" placeholder="overrides OPENAI_BASE_URL" />
+        </label>
+      </details>
+
+      <button type="submit" id="submit-btn">Translate</button>
+    </form>
+
+    <section id="progress" class="progress hidden">
+      <div class="bar"><div id="bar-fill" class="bar-fill"></div></div>
+      <p id="progress-text" class="progress-text">Starting…</p>
+      <p id="failed-note" class="failed-note hidden"></p>
+    </section>
+
+    <section id="result" class="result hidden">
+      <a id="download-link" class="download-btn" href="#">Download translation</a>
+    </section>
+
+    <section id="error" class="error hidden"></section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
