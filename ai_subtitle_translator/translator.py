@@ -34,6 +34,46 @@ from ai_subtitle_translator.postprocess import postprocess_persian
 
 logger = logging.getLogger(__name__)
 
+
+# -- Debug request/response logging --
+
+
+def _log_llm_request(
+    backend: str,
+    model: str,
+    system: str,
+    messages: list[dict[str, str]],
+    temperature: float | None,
+) -> None:
+    """At DEBUG level, log the full outgoing LLM request (system + messages).
+
+    Guarded by ``isEnabledFor`` so the (potentially large) JSON formatting is
+    skipped entirely unless debug logging is on.
+    """
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    logger.debug(
+        "LLM request [%s] model=%s temperature=%s\n--- system ---\n%s\n--- messages ---\n%s",
+        backend,
+        model,
+        temperature,
+        system or "(none)",
+        json.dumps(messages, ensure_ascii=False, indent=2),
+    )
+
+
+def _log_llm_response(backend: str, model: str, content: str) -> None:
+    """At DEBUG level, log the raw LLM response text."""
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    logger.debug(
+        "LLM response [%s] model=%s\n--- response ---\n%s",
+        backend,
+        model,
+        content,
+    )
+
+
 # -- Prompt builders --
 
 
@@ -244,7 +284,18 @@ class _OpenAIProvider:
         temperature: float,
     ) -> str:
         temp = temperature if self._send_temperature else None
+        _log_llm_request("openai", model, system, messages, temp)
+        content = await self._dispatch(system, messages, model, temp)
+        _log_llm_response("openai", model, content)
+        return content
 
+    async def _dispatch(
+        self,
+        system: str,
+        messages: list[dict[str, str]],
+        model: str,
+        temp: float | None,
+    ) -> str:
         if self._api_mode == "responses" or self._use_responses.get(model):
             return await self._chat_via_responses(system, messages, model, temp)
 
@@ -410,14 +461,17 @@ class _CodexProvider:
         model: str,
         temperature: float,
     ) -> str:
+        temp = temperature if self._send_temperature else None
+        _log_llm_request("codex", model, system, messages, temp)
+
         body: dict[str, Any] = {
             "model": model,
             "stream": True,
             "instructions": system or None,
             "input": _to_codex_input(messages),
         }
-        if self._send_temperature and temperature is not None:
-            body["temperature"] = temperature
+        if temp is not None:
+            body["temperature"] = temp
 
         headers = {
             "Authorization": f"Bearer {self._api_key}",
@@ -432,7 +486,9 @@ class _CodexProvider:
                     raise RuntimeError(f"codex HTTP {resp.status_code}: {detail[:300]}")
                 lines = [line async for line in resp.aiter_lines()]
 
-        return _extract_codex_text(lines)
+        content = _extract_codex_text(lines)
+        _log_llm_response("codex", model, content)
+        return content
 
 
 def _build_provider(config: TranslatorConfig) -> _ChatProvider:

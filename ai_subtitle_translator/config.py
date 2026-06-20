@@ -39,6 +39,10 @@ class ChunkConfig:
 
 @dataclass
 class TranslatorConfig:
+    # Logging verbosity: DEBUG | INFO | WARNING | ERROR. At DEBUG the full
+    # outgoing LLM request (system prompt + messages) and the raw response are
+    # logged for every call.
+    log_level: str = _env("LOG_LEVEL", "INFO")  # type: ignore[assignment]
     target_language: str = _env("TARGET_LANGUAGE", "Persian (Farsi)")  # type: ignore[assignment]
     model: str = _env("OPENAI_MODEL", "gpt-4o-mini")  # type: ignore[assignment]
     api_key: str | None = _env("OPENAI_API_KEY")

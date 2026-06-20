@@ -50,6 +50,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ai_subtitle_translator")
 
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+
+
+def _configure_logging(level_name: str) -> None:
+    """Apply the resolved log level to the root logger.
+
+    At DEBUG, the providers log every outgoing LLM request and raw response.
+    """
+    level = getattr(logging, level_name.upper(), None)
+    if not isinstance(level, int):
+        logger.warning("Unknown log level %r — falling back to INFO", level_name)
+        level = logging.INFO
+    logging.getLogger().setLevel(level)
+
 
 async def translate_file(
     input_path: str,
@@ -279,6 +293,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path for the translated subtitle file (default: <input>.fa.<ext>)",
     )
 
+    # Logging
+    p.add_argument(
+        "--log-level", default=None, choices=LOG_LEVELS,
+        help="Logging verbosity (default: from .env or 'INFO'). At DEBUG, every "
+             "LLM request (system prompt + messages) and raw response is logged.",
+    )
+    p.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Shortcut for --log-level DEBUG",
+    )
+
     # Translation
     p.add_argument(
         "--provider", default=None, choices=["copilot", "codex"],
@@ -400,6 +425,13 @@ def main() -> None:
         chunk_cfg.context_lines = args.context_lines
 
     translator_cfg = TranslatorConfig()
+    # Resolve log level (CLI > --verbose > .env default) and apply it before any
+    # translation work runs so debug request/response logging takes effect.
+    if args.verbose:
+        translator_cfg.log_level = "DEBUG"
+    if args.log_level is not None:
+        translator_cfg.log_level = args.log_level
+    _configure_logging(translator_cfg.log_level)
     if args.provider is not None:
         translator_cfg.provider = args.provider
     if args.providers is not None:

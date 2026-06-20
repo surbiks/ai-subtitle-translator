@@ -1,5 +1,5 @@
 {
-  "strategy": "failover",
+  "strategy": "failover | round_robin",
   "providers": [
     {
       "name": "codex-acct1",
